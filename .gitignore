@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.local
+data/
+logs/
+playwright-profile/
+secrets/
+coverage/
+.npm-cache/
+*.db
+*.db-shm
+*.db-wal
+*.log
