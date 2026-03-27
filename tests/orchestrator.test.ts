@@ -73,7 +73,7 @@ const config: AppConfig = {
     dryRun: true
   },
   valiantExecutionMode: "dry-run",
-  valiantBaseUrl: "https://app.valiant.trade",
+  valiantBaseUrl: "https://valiant.trade",
   valiantPrivateApiBaseUrl: undefined,
   valiantPrivateApiKey: undefined,
   valiantPrivateApiSecret: undefined,
@@ -110,7 +110,7 @@ test("open a position for a valid entry signal", async () => {
       takeProfit: 110,
       stopLoss: 95,
       leverage: 10,
-      statusText: "Aguardando confirmaÁ„o",
+      statusText: "Aguardando confirma√ß√£o",
       messageId: "m1",
       messageDate: "2026-03-26T00:00:00.000Z",
       rawText: "raw"
@@ -145,7 +145,7 @@ test("apply the profit action only once", async () => {
       takeProfit: 120,
       stopLoss: 90,
       leverage: 10,
-      statusText: "Aguardando confirmaÁ„o",
+      statusText: "Aguardando confirma√ß√£o",
       messageId: "m1",
       messageDate: "2026-03-26T00:00:00.000Z",
       rawText: "raw"
@@ -191,6 +191,46 @@ test("apply the profit action only once", async () => {
   const position = orchestrator.listPositions()[0];
   assert.equal(position.profitActionApplied, true);
   assert.equal(position.stopLoss, 100);
+  db.close();
+  cleanup();
+});
+
+test("reset local positions clears active positions", async () => {
+  cleanup();
+  const db = await AppDatabase.open(dbPath, config.defaultRuntimeConfig);
+  const notifier = new MockNotifier();
+  const orchestrator = new TradeOrchestrator(
+    config,
+    db,
+    new MockExecutor(),
+    notifier as unknown as Notifier,
+    { info() {}, error() {}, warn() {} } as never
+  );
+
+  await orchestrator.handleParsedSignal(
+    {
+      type: "ENTRY",
+      symbol: "SOL",
+      side: "LONG",
+      entry: 100,
+      takeProfit: 110,
+      stopLoss: 95,
+      leverage: 10,
+      statusText: "Aguardando confirma√ß√£o",
+      messageId: "m1",
+      messageDate: "2026-03-26T00:00:00.000Z",
+      rawText: "raw"
+    },
+    "1",
+    { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+  );
+
+  const resetCount = orchestrator.resetLocalPositions();
+  assert.equal(resetCount, 1);
+  assert.equal(orchestrator.listPositions().length, 0);
+  assert.equal(db.listAllPositions()[0]?.status, "CLOSED");
+  assert.equal(db.listAllPositions()[0]?.currentSize, 0);
+
   db.close();
   cleanup();
 });

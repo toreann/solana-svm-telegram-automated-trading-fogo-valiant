@@ -21,6 +21,14 @@ export function normalizeSymbol(value: string): string {
   return value.trim().toUpperCase();
 }
 
+export function normalizeLeverage(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 1;
+  }
+
+  return Math.max(1, Math.round(value));
+}
+
 export function round(value: number, decimals = 8): number {
   const factor = 10 ** decimals;
   return Math.round(value * factor) / factor;

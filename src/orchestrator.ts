@@ -5,6 +5,7 @@ import type { Notifier } from "./notifier.js";
 import type {
   AppConfig,
   ExecutionRequest,
+  ExecutionResult,
   ParsedEntrySignal,
   ParsedProfitSignal,
   ParsedSignal,
@@ -35,6 +36,36 @@ export class TradeOrchestrator {
 
   public listPositions(): PositionState[] {
     return this.database.listActivePositions();
+  }
+
+  public resetLocalPositions(): number {
+    const activePositions = this.database.listActivePositions();
+    if (activePositions.length === 0) {
+      return 0;
+    }
+
+    const updatedAt = nowIso();
+    for (const position of activePositions) {
+      position.status = position.status === "PENDING" ? "CANCELLED" : "CLOSED";
+      position.currentSize = 0;
+      position.updatedAt = updatedAt;
+      this.database.upsertPosition(position);
+    }
+
+    this.logger.warn(
+      {
+        count: activePositions.length,
+        mode: this.config.valiantExecutionMode,
+        dryRun: this.database.getRuntimeConfig().dryRun
+      },
+      "Reset local active positions"
+    );
+
+    return activePositions.length;
+  }
+
+  public getExecutionMode(): AppConfig["valiantExecutionMode"] {
+    return this.config.valiantExecutionMode;
   }
 
   public async getPnlSummary(): Promise<PnlSummary> {
@@ -99,11 +130,12 @@ export class TradeOrchestrator {
     chatId: string,
     senderId: string,
     runtimeConfig: RuntimeConfig,
+    appliedLeverage: number,
     remoteOrderId?: string,
     remotePositionId?: string,
     status: PositionState["status"] = "OPEN"
   ): PositionState {
-    const size = round((runtimeConfig.marginPerTrade * signal.leverage) / signal.entry, 8);
+    const size = round((runtimeConfig.marginPerTrade * appliedLeverage) / signal.entry, 8);
     const timestamp = nowIso();
     return {
       id: newId(),
@@ -115,7 +147,7 @@ export class TradeOrchestrator {
       initialSize: size,
       takeProfit: signal.takeProfit,
       stopLoss: signal.stopLoss,
-      leverage: signal.leverage,
+      leverage: appliedLeverage,
       margin: runtimeConfig.marginPerTrade,
       sourceMessageId: signal.messageId,
       sourceChatId: chatId,
@@ -128,6 +160,15 @@ export class TradeOrchestrator {
       createdAt: timestamp,
       updatedAt: timestamp
     };
+  }
+
+  private resolveAppliedLeverage(signal: ParsedEntrySignal, result: ExecutionResult): number {
+    const appliedLeverage = result.metadata?.appliedLeverage;
+    if (typeof appliedLeverage === "number" && Number.isFinite(appliedLeverage) && appliedLeverage > 0) {
+      return appliedLeverage;
+    }
+
+    return signal.leverage;
   }
 
   private async handleEntrySignal(signal: ParsedEntrySignal, chatId: string, sender: SenderIdentity): Promise<void> {
@@ -174,25 +215,57 @@ export class TradeOrchestrator {
       return;
     }
 
+    const appliedLeverage = this.resolveAppliedLeverage(signal, result);
     const position = this.buildPosition(
       signal,
       chatId,
       sender.telegramUserId,
       runtimeConfig,
+      appliedLeverage,
       result.remoteOrderId,
       result.remotePositionId,
       result.resultingStatus ?? "OPEN"
     );
     this.database.upsertPosition(position);
-    await this.executor.setProtectionOrders(position);
+    const protectionResult = await this.executor.setProtectionOrders(position);
+    const protectionFailureReason = protectionResult.status === "accepted"
+      ? null
+      : (protectionResult.reason ?? "Failed to place TP/SL orders");
 
+    if (protectionFailureReason) {
+      position.lastError = protectionFailureReason;
+      position.updatedAt = nowIso();
+      this.database.upsertPosition(position);
+      this.logger.warn(
+        {
+          symbol: position.symbol,
+          side: position.side,
+          positionId: position.id,
+          reason: protectionFailureReason
+        },
+        "Entry was placed but protection orders failed"
+      );
+    } else if (position.lastError) {
+      position.lastError = null;
+      position.updatedAt = nowIso();
+      this.database.upsertPosition(position);
+    }
+
+    const isDryRunExecution = this.config.valiantExecutionMode === "dry-run";
     await this.notifier.notify({
       type: "ENTRY_PLACED",
-      title: `[${position.symbol}] ${position.side} order placed`,
+      title: isDryRunExecution
+        ? `[DRY RUN] [${position.symbol}] ${position.side} simulated`
+        : protectionFailureReason
+          ? `[${position.symbol}] ${position.side} order placed with TP/SL warning`
+        : `[${position.symbol}] ${position.side} order placed`,
       body: [
+        `Execution adapter: ${this.config.valiantExecutionMode}`,
+        ...(isDryRunExecution ? ["No live order was sent to Valiant."] : []),
         `Entry: ${position.entryPrice}`,
         `TP: ${position.takeProfit}`,
         `SL: ${position.stopLoss}`,
+        ...(protectionFailureReason ? [`Protection orders: ${protectionFailureReason}`] : ["Protection orders: configured"]),
         `Leverage: ${position.leverage}x`,
         `Margin: ${position.margin} USDC`,
         `Message: ${position.sourceMessageId}`
@@ -276,6 +349,39 @@ export class TradeOrchestrator {
     position.stopLoss = position.entryPrice;
     position.updatedAt = nowIso();
     this.database.upsertPosition(position);
+    return position;
+  }
+
+  public async reapplyProtectionOrders(positionId: string): Promise<PositionState | undefined> {
+    const position = this.database.getPositionById(positionId);
+    if (!position) {
+      return undefined;
+    }
+
+    const result = await this.executor.setProtectionOrders(position);
+    if (result.status !== "accepted") {
+      position.lastError = result.reason ?? "Failed to reapply TP/SL orders";
+      position.updatedAt = nowIso();
+      this.database.upsertPosition(position);
+      throw new Error(position.lastError);
+    }
+
+    position.lastError = null;
+    position.updatedAt = nowIso();
+    this.database.upsertPosition(position);
+
+    await this.notifier.notify({
+      type: "INFO",
+      title: `[${position.symbol}] TP/SL reapplied`,
+      body: [
+        `Side: ${position.side}`,
+        `TP: ${position.takeProfit}`,
+        `SL: ${position.stopLoss}`,
+        `Position: ${position.id}`
+      ].join("\n"),
+      dedupeKey: `tpsl:${position.id}:${position.updatedAt}`
+    });
+
     return position;
   }
 }

@@ -20,6 +20,7 @@ function readSession(path: string): string {
 
 export class TelegramSignalIngestor {
   private readonly client: TelegramClient;
+  private readonly discoveredChatIds = new Set<string>();
 
   public constructor(
     private readonly config: AppConfig,
@@ -50,6 +51,17 @@ export class TelegramSignalIngestor {
     ensureParentDir(this.config.telegramSessionFile);
     writeFileSync(this.config.telegramSessionFile, String(this.client.session.save()), "utf8");
 
+    this.logger.info(
+      {
+        signalChatId: this.config.telegramSignalChatId || null,
+        allowedSenderIdsConfigured: this.config.telegramAllowedSenderIds.length,
+        allowedSenderLabelsConfigured: this.config.telegramAllowedSenderLabels.length
+      },
+      this.config.telegramSignalChatId
+        ? "Telegram client connected and listening for the configured signal chat"
+        : "Telegram client connected in discovery mode. Incoming messages will log chatId and sender info"
+    );
+
     this.client.addEventHandler(async (event) => {
       const message = event.message;
       if (!message?.message) {
@@ -57,10 +69,17 @@ export class TelegramSignalIngestor {
       }
 
       const chatId = String(message.chatId ?? "");
-      if (chatId !== this.config.telegramSignalChatId) {
+      if (!chatId) {
+        this.logger.warn("Skipping message without chat identity");
         return;
       }
 
+      const chat = await this.safeGetChat(message);
+      const chatIdentity = {
+        chatId,
+        title: this.buildChatTitle(chat),
+        username: this.readField(chat, "username")
+      };
       const sender = await message.getSender();
       const senderIdentity: SenderIdentity = {
         telegramUserId: String((sender as { id?: string | number } | undefined)?.id ?? ""),
@@ -69,13 +88,30 @@ export class TelegramSignalIngestor {
         isAllowed: false
       };
 
+      if (!this.config.telegramSignalChatId) {
+        this.logDiscovery(chatIdentity, senderIdentity);
+        return;
+      }
+
+      if (chatId !== this.config.telegramSignalChatId) {
+        this.logNonSignalChat(chatIdentity);
+        return;
+      }
+
       if (!senderIdentity.telegramUserId) {
         this.logger.warn("Skipping message without sender identity");
         return;
       }
 
       if (!this.senderFilter.isAllowed(senderIdentity)) {
-        this.logger.info({ senderIdentity }, "Ignoring message from unauthorized sender");
+        this.logger.info(
+          {
+            chatIdentity,
+            senderIdentity,
+            hint: `Set TELEGRAM_ALLOWED_SENDER_IDS=${senderIdentity.telegramUserId}`
+          },
+          "Ignoring message from unauthorized sender"
+        );
         return;
       }
 
@@ -106,6 +142,49 @@ export class TelegramSignalIngestor {
     const title = this.readField(sender, "title");
     const combined = [firstName, lastName].filter(Boolean).join(" ").trim();
     return combined || title;
+  }
+
+  private buildChatTitle(chat: unknown): string | null {
+    return this.readField(chat, "title") ?? this.buildDisplayName(chat);
+  }
+
+  private logDiscovery(
+    chatIdentity: { chatId: string; title: string | null; username: string | null },
+    senderIdentity: SenderIdentity
+  ): void {
+    this.logger.info(
+      {
+        chatIdentity,
+        senderIdentity,
+        hint: `Set TELEGRAM_SIGNAL_CHAT_ID=${chatIdentity.chatId}`,
+        senderHint: senderIdentity.telegramUserId
+          ? `Set TELEGRAM_ALLOWED_SENDER_IDS=${senderIdentity.telegramUserId}`
+          : undefined
+      },
+      "Observed Telegram message while signal chat discovery is enabled"
+    );
+  }
+
+  private logNonSignalChat(chatIdentity: { chatId: string; title: string | null; username: string | null }): void {
+    if (this.discoveredChatIds.has(chatIdentity.chatId)) {
+      return;
+    }
+    this.discoveredChatIds.add(chatIdentity.chatId);
+    this.logger.info(
+      {
+        chatIdentity,
+        configuredSignalChatId: this.config.telegramSignalChatId
+      },
+      "Ignoring message from a non-signal chat"
+    );
+  }
+
+  private async safeGetChat(message: { getChat?: () => Promise<unknown> }): Promise<unknown> {
+    try {
+      return message.getChat ? await message.getChat() : null;
+    } catch {
+      return null;
+    }
   }
 
   public async disconnect(): Promise<void> {

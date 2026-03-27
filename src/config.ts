@@ -1,8 +1,19 @@
-import "dotenv/config";
+import { existsSync } from "node:fs";
 
+import { config as loadDotenv } from "dotenv";
 import { z } from "zod";
 
 import type { AppConfig, RuntimeConfig } from "./types.js";
+
+const discoveredEnvFiles: string[] = [];
+
+for (const path of [".env", "env.env"]) {
+  if (!existsSync(path)) {
+    continue;
+  }
+  loadDotenv({ path, override: false });
+  discoveredEnvFiles.push(path);
+}
 
 const envSchema = z.object({
   NODE_ENV: z.string().default("development"),
@@ -11,7 +22,7 @@ const envSchema = z.object({
   TELEGRAM_API_ID: z.coerce.number().int().positive(),
   TELEGRAM_API_HASH: z.string().min(1),
   TELEGRAM_SESSION_FILE: z.string().default("./secrets/telegram.session"),
-  TELEGRAM_SIGNAL_CHAT_ID: z.string().min(1),
+  TELEGRAM_SIGNAL_CHAT_ID: z.string().default(""),
   TELEGRAM_ALLOWED_SENDER_IDS: z.string().default(""),
   TELEGRAM_ALLOWED_SENDER_LABELS: z.string().default("@MacacoClub_bot,Mr. Robot"),
   CONTROL_BOT_TOKEN: z.string().min(1),
@@ -32,11 +43,16 @@ const envSchema = z.object({
   VALIANT_EXECUTION_MODE: z
     .enum(["dry-run", "private", "playwright", "hybrid"])
     .default("dry-run"),
-  VALIANT_BASE_URL: z.string().default("https://app.valiant.trade"),
+  VALIANT_BASE_URL: z.string().default("https://valiant.trade"),
   VALIANT_AGENT_KEY: z.string().optional(),
   VALIANT_PRIVATE_API_BASE_URL: z.string().optional(),
   VALIANT_PRIVATE_API_KEY: z.string().optional(),
   VALIANT_PRIVATE_API_SECRET: z.string().optional(),
+  VALIANT_PLAYWRIGHT_EXECUTABLE_PATH: z.string().optional(),
+  VALIANT_PLAYWRIGHT_HEADLESS: z
+    .string()
+    .default("true")
+    .transform((value) => value.toLowerCase() !== "false"),
   VALIANT_PLAYWRIGHT_PROFILE_DIR: z.string().default("./playwright-profile"),
   VALIANT_MARKET_ROUTE: z.string().default("/perps")
 });
@@ -46,6 +62,10 @@ function splitCsv(value: string): string[] {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+export function getLoadedEnvFiles(): string[] {
+  return [...discoveredEnvFiles];
 }
 
 export function loadConfig(): AppConfig {
@@ -79,6 +99,8 @@ export function loadConfig(): AppConfig {
     valiantPrivateApiBaseUrl: env.VALIANT_PRIVATE_API_BASE_URL,
     valiantPrivateApiKey: env.VALIANT_PRIVATE_API_KEY,
     valiantPrivateApiSecret: env.VALIANT_PRIVATE_API_SECRET,
+    valiantPlaywrightExecutablePath: env.VALIANT_PLAYWRIGHT_EXECUTABLE_PATH,
+    valiantPlaywrightHeadless: env.VALIANT_PLAYWRIGHT_HEADLESS,
     valiantPlaywrightProfileDir: env.VALIANT_PLAYWRIGHT_PROFILE_DIR,
     valiantMarketRoute: env.VALIANT_MARKET_ROUTE
   };

@@ -159,6 +159,8 @@ export interface AppConfig {
   valiantPrivateApiBaseUrl?: string;
   valiantPrivateApiKey?: string;
   valiantPrivateApiSecret?: string;
+  valiantPlaywrightExecutablePath?: string;
+  valiantPlaywrightHeadless?: boolean;
   valiantPlaywrightProfileDir: string;
   valiantMarketRoute: string;
 }

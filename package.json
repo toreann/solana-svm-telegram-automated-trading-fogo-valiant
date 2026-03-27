@@ -12,6 +12,7 @@
     "auth:telegram": "npm run build && node dist/src/tools/generateTelegramSession.js"
   },
   "dependencies": {
+    "@nktkas/hyperliquid": "^0.32.2",
     "dotenv": "^16.4.7",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
@@ -19,6 +20,7 @@
     "sql.js": "^1.13.0",
     "telegraf": "^4.16.3",
     "telegram": "^2.26.22",
+    "viem": "^2.47.6",
     "zod": "^3.24.2"
   },
   "devDependencies": {

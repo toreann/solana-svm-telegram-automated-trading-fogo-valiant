@@ -16,8 +16,10 @@ export class Notifier {
       return;
     }
 
-    await this.controlBot.telegram.sendMessage(this.ownerChatId, `*${event.title}*\n\n${event.body}`, {
-      parse_mode: "Markdown"
-    });
+    try {
+      await this.controlBot.telegram.sendMessage(this.ownerChatId, `${event.title}\n\n${event.body}`);
+    } catch (error) {
+      console.error("Failed to deliver Telegram notification", error);
+    }
   }
 }

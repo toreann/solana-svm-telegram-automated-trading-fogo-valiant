@@ -10,19 +10,23 @@ Local TypeScript bot that:
 
 ## Setup
 
-1. Copy `.env.example` to `.env`.
-2. Fill in these required values in `.env`:
+1. Create either `.env` or `env.env`.
+2. Fill in these required values in the env file:
    - `TELEGRAM_API_ID`
    - `TELEGRAM_API_HASH`
    - `CONTROL_BOT_TOKEN`
    - `CONTROL_OWNER_CHAT_ID`
    - `CONTROL_OWNER_USER_ID`
-   - `TELEGRAM_SIGNAL_CHAT_ID`
-3. Optional Valiant credentials in `.env`:
+   - `TELEGRAM_SIGNAL_CHAT_ID` (optional while discovering the source chat)
+3. Optional Valiant credentials in the env file:
    - `VALIANT_AGENT_KEY`
    - `VALIANT_PRIVATE_API_BASE_URL`
-   - `VALIANT_PRIVATE_API_KEY`
-   - `VALIANT_PRIVATE_API_SECRET`
+   - `VALIANT_PRIVATE_API_KEY` (legacy / optional)
+   - `VALIANT_PRIVATE_API_SECRET` (legacy / optional)
+   - `VALIANT_PLAYWRIGHT_EXECUTABLE_PATH` (optional Brave/Chrome/Chromium path)
+   - `VALIANT_PLAYWRIGHT_HEADLESS` (`true` by default)
+   - `VALIANT_PLAYWRIGHT_PROFILE_DIR` (persistent browser profile used by Playwright)
+   - `VALIANT_MARKET_ROUTE` (supports `/perps/{symbol}` or `/perps/:symbol`)
 4. Install dependencies:
 
 ```bash
@@ -47,10 +51,28 @@ Start in safe dry-run mode first:
 npm run dev
 ```
 
+If `TELEGRAM_SIGNAL_CHAT_ID` is blank, the bot starts in discovery mode and logs each observed Telegram `chatId` plus sender info so you can copy the correct values into your env file.
+
+## Valiant Private Transport
+
+- Agent-key auth is the primary live execution mode. Set `VALIANT_AGENT_KEY` and use `VALIANT_EXECUTION_MODE=private` or `hybrid`.
+- The bot now signs orders directly against the Hyperliquid exchange transport that backs Valiant.
+- If `VALIANT_PRIVATE_API_BASE_URL` is blank, the app defaults to `https://api.hyperliquid.xyz`.
+- Legacy `VALIANT_PRIVATE_API_KEY` and `VALIANT_PRIVATE_API_SECRET` remain optional helpers, but live order execution no longer depends on the old `/orders/...` Valiant REST assumption.
+
+## Valiant Playwright Fallback
+
+- `VALIANT_EXECUTION_MODE=playwright` uses a persistent browser profile to trade through the Valiant web UI.
+- `VALIANT_EXECUTION_MODE=hybrid` still tries the private transport first and falls back to Playwright if the private request fails.
+- The browser profile in `VALIANT_PLAYWRIGHT_PROFILE_DIR` must already be signed into Valiant and have perps enabled.
+- If Playwright cannot find your browser automatically, set `VALIANT_PLAYWRIGHT_EXECUTABLE_PATH` to the Brave, Chrome, or Chromium binary.
+- The Playwright flow places market entries, then attempts to configure TP/SL and reduction actions through the Positions tab.
+- For cleaner symbol targeting, set `VALIANT_MARKET_ROUTE=/perps/{symbol}` if your Valiant deployment supports symbol-specific routes.
+
 ## Important Notes
 
 - `VALIANT_EXECUTION_MODE=dry-run` is the safe default.
 - `hybrid` mode tries private transport first and then Playwright.
 - The control bot sends notifications to `CONTROL_OWNER_CHAT_ID` using `CONTROL_BOT_TOKEN`.
 - `.env`, `secrets/`, `data/`, and browser profiles are ignored by Git.
-- The Playwright path still needs the real Valiant UI selectors and workflow from a live session.
+- When Playwright fails, it saves a screenshot under `playwright-profile/debug-artifacts/` to make debugging easier.

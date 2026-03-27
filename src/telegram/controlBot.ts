@@ -1,1 +1,321 @@
-import type { Logger } from "pino";import { Markup, Telegraf, type Context, type NarrowedContext } from "telegraf";import type { CallbackQuery, Update } from "telegraf/types";import type { AppDatabase } from "../db.js";import type { TradeOrchestrator } from "../orchestrator.js";import type { PositionState, RuntimeConfig } from "../types.js";import { newId } from "../utils.js";type PromptKey = "marginPerTrade" | "maxLeverageCap" | "profitPartialClosePercent";type PromptState = { key: PromptKey };function statusLabel(paused: boolean): string {  return paused ? "PAUSED" : "ACTIVE";}function formatMenu(runtimeConfig: RuntimeConfig, positions: PositionState[]): string {  return [    "*Trade Bot - Main Menu*",    "",    `Margin per trade: *$${runtimeConfig.marginPerTrade.toFixed(2)} USDC*`,    `Leverage cap: *${runtimeConfig.maxLeverageCap}x*`,    `Partial close: *${runtimeConfig.profitPartialClosePercent}%*`,    `Status: *${statusLabel(runtimeConfig.paused)}*`,    `Open/pending positions: *${positions.length}*`,    `Mode: *${runtimeConfig.dryRun ? "DRY RUN" : "LIVE"}*`  ].join("\n");}function mainKeyboard(paused: boolean) {  return Markup.inlineKeyboard([    [Markup.button.callback("Status", "menu:status"), Markup.button.callback("Positions", "menu:positions")],    [Markup.button.callback("Configs", "menu:configs"), Markup.button.callback("P&L", "menu:pnl")],    [Markup.button.callback(paused ? "Resume" : "Pause", "menu:toggle")]  ]);}function configKeyboard() {  return Markup.inlineKeyboard([    [Markup.button.callback("Margin per trade", "config:marginPerTrade")],    [Markup.button.callback("Leverage cap", "config:maxLeverageCap")],    [Markup.button.callback("Partial close %", "config:profitPartialClosePercent")],    [Markup.button.callback("Dry-run on/off", "config:dryRun")],    [Markup.button.callback("Back", "menu:home")]  ]);}function positionsKeyboard(positions: PositionState[]) {  const rows = positions.flatMap((position) => [    [      Markup.button.callback(`Close ${position.symbol}`, `position:close:${position.id}`),      Markup.button.callback(`Move SL ${position.symbol}`, `position:sl:${position.id}`)    ]  ]);  rows.push([Markup.button.callback("Back", "menu:home")]);  return Markup.inlineKeyboard(rows);}function isAuthorized(ctx: Context, ownerChatId: string, ownerUserId: string): boolean {  return String(ctx.chat?.id ?? "") === ownerChatId && String(ctx.from?.id ?? "") === ownerUserId;}export class TelegramControlBot {  public readonly bot: Telegraf;  private readonly prompts = new Map<string, PromptState>();  private orchestrator?: TradeOrchestrator;  private handlersRegistered = false;  public constructor(    botToken: string,    private readonly ownerChatId: string,    private readonly ownerUserId: string,    private readonly database: AppDatabase,    private readonly logger: Logger  ) {    this.bot = new Telegraf(botToken);  }  public attachOrchestrator(orchestrator: TradeOrchestrator): void {    this.orchestrator = orchestrator;    if (!this.handlersRegistered) {      this.registerHandlers();      this.handlersRegistered = true;    }  }  private getOrchestrator(): TradeOrchestrator {    if (!this.orchestrator) {      throw new Error("Orchestrator is not attached");    }    return this.orchestrator;  }  private registerHandlers(): void {    this.bot.use(async (ctx, next) => {      if (!isAuthorized(ctx, this.ownerChatId, this.ownerUserId)) {        if (ctx.chat?.id && ctx.from?.id) {          this.logger.warn({ chatId: ctx.chat.id, userId: ctx.from.id }, "Unauthorized control bot access");        }        if ("reply" in ctx) {          await ctx.reply("Unauthorized.");        }        return;      }      await next();    });    this.bot.start(async (ctx) => {      await ctx.reply("Trade Bot started and listening for signals.");      await this.renderMenu(ctx);    });    this.bot.command("menu", async (ctx) => {      await this.renderMenu(ctx);    });    this.bot.on("text", async (ctx, next) => {      const prompt = this.prompts.get(String(ctx.chat?.id ?? this.ownerChatId));      if (!prompt) {        await next();        return;      }      const rawValue = ctx.message.text.trim();      try {        const orchestrator = this.getOrchestrator();        if (prompt.key === "marginPerTrade") {          orchestrator.updateRuntimeConfig({ marginPerTrade: this.parsePositive(rawValue) });        } else if (prompt.key === "maxLeverageCap") {          orchestrator.updateRuntimeConfig({ maxLeverageCap: this.parsePositive(rawValue) });        } else if (prompt.key === "profitPartialClosePercent") {          const percent = this.parsePositive(rawValue);          if (percent > 100) {            throw new Error("Partial close must be <= 100");          }          orchestrator.updateRuntimeConfig({ profitPartialClosePercent: percent });        }        this.prompts.delete(String(ctx.chat?.id ?? this.ownerChatId));        this.database.appendControlAction(newId(), "config_update", JSON.stringify(prompt), "success");        await ctx.reply("Config updated.");        await this.renderMenu(ctx);      } catch (error) {        await ctx.reply(`Invalid value. ${String(error)}`);      }    });    this.bot.on("callback_query", async (ctx) => {      const callback = (ctx.callbackQuery as CallbackQuery.DataQuery).data;      await this.handleCallback(ctx as NarrowedContext<Context<Update>, Update.CallbackQueryUpdate<CallbackQuery.DataQuery>>, callback);      await ctx.answerCbQuery();    });  }  private parsePositive(value: string): number {    const parsed = Number.parseFloat(value);    if (!Number.isFinite(parsed) || parsed <= 0) {      throw new Error("Expected a positive number");    }    return parsed;  }  private async renderMenu(ctx: Context): Promise<void> {    const orchestrator = this.getOrchestrator();    const runtimeConfig = orchestrator.getRuntimeConfig();    const positions = orchestrator.listPositions();    await ctx.reply(formatMenu(runtimeConfig, positions), {      parse_mode: "Markdown",      ...mainKeyboard(runtimeConfig.paused)    });  }  private async handleCallback(    ctx: NarrowedContext<Context<Update>, Update.CallbackQueryUpdate<CallbackQuery.DataQuery>>,    callback: string  ): Promise<void> {    const orchestrator = this.getOrchestrator();    if (callback === "menu:home" || callback === "menu:status") {      await this.renderMenu(ctx);      return;    }    if (callback === "menu:positions") {      const positions = orchestrator.listPositions();      const text =        positions.length === 0          ? "No active positions."          : positions              .map(                (position) =>                  `*${position.symbol}* ${position.side}\nStatus: ${position.status}\nEntry: ${position.entryPrice}\nSize: ${position.currentSize}\nTP: ${position.takeProfit}\nSL: ${position.stopLoss}`              )              .join("\n\n");      await ctx.reply(text, {        parse_mode: "Markdown",        ...positionsKeyboard(positions)      });      return;    }    if (callback === "menu:configs") {      const runtimeConfig = orchestrator.getRuntimeConfig();      await ctx.reply(        [          "*Configs*",          `Margin per trade: ${runtimeConfig.marginPerTrade}`,          `Leverage cap: ${runtimeConfig.maxLeverageCap}`,          `Partial close %: ${runtimeConfig.profitPartialClosePercent}`,          `Dry-run: ${runtimeConfig.dryRun}`        ].join("\n"),        {          parse_mode: "Markdown",          ...configKeyboard()        }      );      return;    }    if (callback === "menu:pnl") {      const pnl = await orchestrator.getPnlSummary();      await ctx.reply(        [          "*P&L*",          `Realized: ${pnl.realizedPnl.toFixed(2)}`,          `Unrealized: ${pnl.unrealizedPnl.toFixed(2)}`,          `Open positions: ${pnl.openPositions}`,          `Closed positions: ${pnl.closedPositions}`        ].join("\n"),        { parse_mode: "Markdown" }      );      return;    }    if (callback === "menu:toggle") {      const current = orchestrator.getRuntimeConfig();      const next = orchestrator.updateRuntimeConfig({ paused: !current.paused });      await ctx.reply(`Bot is now ${next.paused ? "paused" : "active"}.`);      await this.renderMenu(ctx);      return;    }    if (callback === "config:dryRun") {      const current = orchestrator.getRuntimeConfig();      const next = orchestrator.updateRuntimeConfig({ dryRun: !current.dryRun });      await ctx.reply(`Dry-run is now ${next.dryRun ? "enabled" : "disabled"}.`);      await this.renderMenu(ctx);      return;    }    if (callback.startsWith("config:")) {      const key = callback.replace("config:", "") as PromptKey;      this.prompts.set(String(ctx.chat?.id ?? this.ownerChatId), { key });      await ctx.reply(`Send the new value for ${key}.`);      return;    }    if (callback.startsWith("position:close:")) {      const positionId = callback.split(":")[2];      await orchestrator.closePosition(positionId);      await ctx.reply("Position close submitted.");      return;    }    if (callback.startsWith("position:sl:")) {      const positionId = callback.split(":")[2];      await orchestrator.moveStopLossToEntry(positionId);      await ctx.reply("Stop loss moved to entry.");    }  }  public async launch(): Promise<void> {    await this.bot.launch();  }  public stop(reason = "SIGINT"): void {    this.bot.stop(reason);  }}
+import type { Logger } from "pino";
+import { Markup, Telegraf, type Context, type NarrowedContext } from "telegraf";
+import type { CallbackQuery, Update } from "telegraf/types";
+
+import type { AppDatabase } from "../db.js";
+import type { TradeOrchestrator } from "../orchestrator.js";
+import type { PositionState, RuntimeConfig } from "../types.js";
+import { newId } from "../utils.js";
+
+type PromptKey = "marginPerTrade" | "maxLeverageCap" | "profitPartialClosePercent";
+type PromptState = { key: PromptKey };
+
+function statusLabel(paused: boolean): string {
+  return paused ? "PAUSED" : "ACTIVE";
+}
+
+function formatMenu(
+  runtimeConfig: RuntimeConfig,
+  positions: PositionState[],
+  executionMode: TradeOrchestrator["getExecutionMode"] extends () => infer T ? T : string
+): string {
+  return [
+    "*Trade Bot - Main Menu*",
+    "",
+    `Margin per trade: *$${runtimeConfig.marginPerTrade.toFixed(2)} USDC*`,
+    `Leverage cap: *${runtimeConfig.maxLeverageCap}x*`,
+    `Partial close: *${runtimeConfig.profitPartialClosePercent}%*`,
+    `Status: *${statusLabel(runtimeConfig.paused)}*`,
+    `Open/pending positions: *${positions.length}*`,
+    `Execution adapter: *${executionMode}*`,
+    `Local dry-run flag: *${runtimeConfig.dryRun ? "ON" : "OFF"}*`
+  ].join("\n");
+}
+
+function mainKeyboard(paused: boolean) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Status", "menu:status"), Markup.button.callback("Positions", "menu:positions")],
+    [Markup.button.callback("Configs", "menu:configs"), Markup.button.callback("P&L", "menu:pnl")],
+    [Markup.button.callback("Reset Positions", "positions:reset")],
+    [Markup.button.callback(paused ? "Resume" : "Pause", "menu:toggle")]
+  ]);
+}
+
+function configKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Margin per trade", "config:marginPerTrade")],
+    [Markup.button.callback("Leverage cap", "config:maxLeverageCap")],
+    [Markup.button.callback("Partial close %", "config:profitPartialClosePercent")],
+    [Markup.button.callback("Dry-run on/off", "config:dryRun")],
+    [Markup.button.callback("Reset Positions", "positions:reset")],
+    [Markup.button.callback("Back", "menu:home")]
+  ]);
+}
+
+function positionsKeyboard(positions: PositionState[]) {
+  const rows = positions.flatMap((position) => [
+    [
+      Markup.button.callback(`Close ${position.symbol}`, `position:close:${position.id}`),
+      Markup.button.callback(`Move SL ${position.symbol}`, `position:sl:${position.id}`)
+    ],
+    [Markup.button.callback(`Reapply TP/SL ${position.symbol}`, `position:tpsl:${position.id}`)]
+  ]);
+  rows.push([Markup.button.callback("Reset Positions", "positions:reset")]);
+  rows.push([Markup.button.callback("Back", "menu:home")]);
+  return Markup.inlineKeyboard(rows);
+}
+
+function isAuthorized(ctx: Context, ownerChatId: string, ownerUserId: string): boolean {
+  return String(ctx.chat?.id ?? "") === ownerChatId && String(ctx.from?.id ?? "") === ownerUserId;
+}
+
+export class TelegramControlBot {
+  public readonly bot: Telegraf;
+  private readonly prompts = new Map<string, PromptState>();
+  private orchestrator?: TradeOrchestrator;
+  private handlersRegistered = false;
+
+  public constructor(
+    botToken: string,
+    private readonly ownerChatId: string,
+    private readonly ownerUserId: string,
+    private readonly database: AppDatabase,
+    private readonly logger: Logger
+  ) {
+    this.bot = new Telegraf(botToken);
+  }
+
+  public attachOrchestrator(orchestrator: TradeOrchestrator): void {
+    this.orchestrator = orchestrator;
+    if (!this.handlersRegistered) {
+      this.registerHandlers();
+      this.handlersRegistered = true;
+    }
+  }
+
+  private getOrchestrator(): TradeOrchestrator {
+    if (!this.orchestrator) {
+      throw new Error("Orchestrator is not attached");
+    }
+    return this.orchestrator;
+  }
+
+  private registerHandlers(): void {
+    this.bot.use(async (ctx, next) => {
+      if (!isAuthorized(ctx, this.ownerChatId, this.ownerUserId)) {
+        if (ctx.chat?.id && ctx.from?.id) {
+          this.logger.warn({ chatId: ctx.chat.id, userId: ctx.from.id }, "Unauthorized control bot access");
+        }
+        if ("reply" in ctx) {
+          await ctx.reply("Unauthorized.");
+        }
+        return;
+      }
+      await next();
+    });
+
+    this.bot.start(async (ctx) => {
+      await ctx.reply("Control menu ready. Use the buttons below to configure the bot or reset local positions.");
+      await this.renderMenu(ctx);
+    });
+
+    this.bot.command("menu", async (ctx) => {
+      await this.renderMenu(ctx);
+    });
+
+    this.bot.command("resetpositions", async (ctx) => {
+      await this.resetPositionsAndConfirm(ctx);
+    });
+
+    this.bot.on("text", async (ctx, next) => {
+      const prompt = this.prompts.get(String(ctx.chat?.id ?? this.ownerChatId));
+      if (!prompt) {
+        await next();
+        return;
+      }
+
+      const rawValue = ctx.message.text.trim();
+      try {
+        const orchestrator = this.getOrchestrator();
+        if (prompt.key === "marginPerTrade") {
+          orchestrator.updateRuntimeConfig({ marginPerTrade: this.parsePositive(rawValue) });
+        } else if (prompt.key === "maxLeverageCap") {
+          orchestrator.updateRuntimeConfig({ maxLeverageCap: this.parsePositive(rawValue) });
+        } else if (prompt.key === "profitPartialClosePercent") {
+          const percent = this.parsePositive(rawValue);
+          if (percent > 100) {
+            throw new Error("Partial close must be <= 100");
+          }
+          orchestrator.updateRuntimeConfig({ profitPartialClosePercent: percent });
+        }
+
+        this.prompts.delete(String(ctx.chat?.id ?? this.ownerChatId));
+        this.database.appendControlAction(newId(), "config_update", JSON.stringify(prompt), "success");
+        await ctx.reply("Config updated.");
+        await this.renderMenu(ctx);
+      } catch (error) {
+        await ctx.reply(`Invalid value. ${String(error)}`);
+      }
+    });
+
+    this.bot.on("callback_query", async (ctx) => {
+      const callback = (ctx.callbackQuery as CallbackQuery.DataQuery).data;
+      await this.handleCallback(
+        ctx as NarrowedContext<Context<Update>, Update.CallbackQueryUpdate<CallbackQuery.DataQuery>>,
+        callback
+      );
+      await ctx.answerCbQuery();
+    });
+  }
+
+  private parsePositive(value: string): number {
+    const parsed = Number.parseFloat(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new Error("Expected a positive number");
+    }
+    return parsed;
+  }
+
+  private async renderMenu(ctx: Context): Promise<void> {
+    const orchestrator = this.getOrchestrator();
+    const runtimeConfig = orchestrator.getRuntimeConfig();
+    const positions = orchestrator.listPositions();
+    await ctx.reply(formatMenu(runtimeConfig, positions, orchestrator.getExecutionMode()), {
+      parse_mode: "Markdown",
+      ...mainKeyboard(runtimeConfig.paused)
+    });
+  }
+
+  private async handleCallback(
+    ctx: NarrowedContext<Context<Update>, Update.CallbackQueryUpdate<CallbackQuery.DataQuery>>,
+    callback: string
+  ): Promise<void> {
+    const orchestrator = this.getOrchestrator();
+
+    if (callback === "menu:home" || callback === "menu:status") {
+      await this.renderMenu(ctx);
+      return;
+    }
+
+    if (callback === "menu:positions") {
+      const positions = orchestrator.listPositions();
+      const text =
+        positions.length === 0
+          ? "No active positions."
+          : positions
+              .map(
+                (position) =>
+                  `*${position.symbol}* ${position.side}\nStatus: ${position.status}\nEntry: ${position.entryPrice}\nSize: ${position.currentSize}\nTP: ${position.takeProfit}\nSL: ${position.stopLoss}`
+              )
+              .join("\n\n");
+      await ctx.reply(text, {
+        parse_mode: "Markdown",
+        ...positionsKeyboard(positions)
+      });
+      return;
+    }
+
+    if (callback === "menu:configs") {
+      const runtimeConfig = orchestrator.getRuntimeConfig();
+      await ctx.reply(
+        [
+          "*Configs*",
+          `Execution adapter: ${orchestrator.getExecutionMode()} (restart required to change)`,
+          `Margin per trade: ${runtimeConfig.marginPerTrade}`,
+          `Leverage cap: ${runtimeConfig.maxLeverageCap}`,
+          `Partial close %: ${runtimeConfig.profitPartialClosePercent}`,
+          `Local dry-run flag: ${runtimeConfig.dryRun}`
+        ].join("\n"),
+        {
+          parse_mode: "Markdown",
+          ...configKeyboard()
+        }
+      );
+      return;
+    }
+
+    if (callback === "menu:pnl") {
+      const pnl = await orchestrator.getPnlSummary();
+      await ctx.reply(
+        [
+          "*P&L*",
+          `Realized: ${pnl.realizedPnl.toFixed(2)}`,
+          `Unrealized: ${pnl.unrealizedPnl.toFixed(2)}`,
+          `Open positions: ${pnl.openPositions}`,
+          `Closed positions: ${pnl.closedPositions}`
+        ].join("\n"),
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    if (callback === "menu:toggle") {
+      const current = orchestrator.getRuntimeConfig();
+      const next = orchestrator.updateRuntimeConfig({ paused: !current.paused });
+      await ctx.reply(`Bot is now ${next.paused ? "paused" : "active"}.`);
+      await this.renderMenu(ctx);
+      return;
+    }
+
+    if (callback === "config:dryRun") {
+      const current = orchestrator.getRuntimeConfig();
+      const next = orchestrator.updateRuntimeConfig({ dryRun: !current.dryRun });
+      await ctx.reply(
+        `Local dry-run flag is now ${next.dryRun ? "enabled" : "disabled"}. Execution adapter remains ${orchestrator.getExecutionMode()}.`
+      );
+      await this.renderMenu(ctx);
+      return;
+    }
+
+    if (callback.startsWith("config:")) {
+      const key = callback.replace("config:", "") as PromptKey;
+      this.prompts.set(String(ctx.chat?.id ?? this.ownerChatId), { key });
+      await ctx.reply(`Send the new value for ${key}.`);
+      return;
+    }
+
+    if (callback === "positions:reset") {
+      await this.resetPositionsAndConfirm(ctx);
+      await this.renderMenu(ctx);
+      return;
+    }
+
+    if (callback.startsWith("position:close:")) {
+      const positionId = callback.split(":")[2];
+      await orchestrator.closePosition(positionId);
+      await ctx.reply("Position close submitted.");
+      return;
+    }
+
+    if (callback.startsWith("position:sl:")) {
+      const positionId = callback.split(":")[2];
+      await orchestrator.moveStopLossToEntry(positionId);
+      await ctx.reply("Stop loss moved to entry.");
+      return;
+    }
+
+    if (callback.startsWith("position:tpsl:")) {
+      const positionId = callback.split(":")[2];
+      await orchestrator.reapplyProtectionOrders(positionId);
+      await ctx.reply("TP/SL reapplied for the current position.");
+    }
+  }
+
+  public async launch(): Promise<void> {
+    await this.bot.launch();
+  }
+
+  public stop(reason = "SIGINT"): void {
+    this.bot.stop(reason);
+  }
+
+  private async resetPositionsAndConfirm(ctx: Context): Promise<void> {
+    const resetCount = this.getOrchestrator().resetLocalPositions();
+    this.database.appendControlAction(newId(), "positions_reset", JSON.stringify({ count: resetCount }), "success");
+    await ctx.reply(
+      resetCount === 0
+        ? "No active local positions to reset."
+        : `Reset ${resetCount} local position${resetCount === 1 ? "" : "s"}. This only clears local bot state, not live Valiant orders.`
+    );
+  }
+}
