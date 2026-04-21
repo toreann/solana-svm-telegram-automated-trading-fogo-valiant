@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 import { ExchangeClient, HttpRequestError, HttpTransport, InfoClient } from "@nktkas/hyperliquid";
 import { ApiRequestError } from "@nktkas/hyperliquid/api/exchange";
@@ -15,6 +16,7 @@ import type { Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
 import type {
+  AgentSessionStatus,
   AppConfig,
   ExecutionRequest,
   ExecutionResult,
@@ -84,6 +86,7 @@ const HYPERLIQUID_MARKET_SLIPPAGE_BPS = 150;
 const HYPERLIQUID_TPSL_MARKET_SLIPPAGE_BPS = 1_000;
 const HYPERLIQUID_POSITION_SYNC_RETRIES = 8;
 const HYPERLIQUID_POSITION_SYNC_DELAY_MS = 350;
+const VALIANT_AGENT_DISCOVERY_TIMEOUT_MS = 5_000;
 
 export function inferValiantPrivateApiBaseUrl(
   configuredBaseUrl: string | undefined,
@@ -219,6 +222,103 @@ function normalizeHexPrivateKey(value?: string): Hex | undefined {
   return /^0x[a-fA-F0-9]{64}$/.test(withPrefix) ? (withPrefix as Hex) : undefined;
 }
 
+function normalizeHexAddress(value?: string): Hex | undefined {
+  const normalized = value?.trim();
+  if (!normalized) {
+    return undefined;
+  }
+
+  const withPrefix = normalized.startsWith("0x") ? normalized : `0x${normalized}`;
+  return /^0x[a-fA-F0-9]{40}$/.test(withPrefix) ? (withPrefix as Hex) : undefined;
+}
+
+interface BrowserStoredAgentCandidate {
+  userAddress?: string;
+  agentAddress?: string;
+  privateKey: string;
+}
+
+function normalizeAddressList(values: readonly string[] | undefined): string[] {
+  return [...new Set(
+    (values ?? [])
+      .map((value) => normalizeHexAddress(value)?.toLowerCase())
+      .filter((value): value is string => Boolean(value))
+  )];
+}
+
+function candidateAgentAddress(candidate: BrowserStoredAgentCandidate): string | undefined {
+  const normalizedAddress = normalizeHexAddress(candidate.agentAddress)?.toLowerCase();
+  if (normalizedAddress) {
+    return normalizedAddress;
+  }
+
+  const normalizedPrivateKey = normalizeHexPrivateKey(candidate.privateKey);
+  if (!normalizedPrivateKey) {
+    return undefined;
+  }
+
+  return privateKeyToAccount(normalizedPrivateKey).address.toLowerCase();
+}
+
+export function selectApprovedAgentPrivateKey(options: {
+  configuredAgentKey?: string;
+  configuredMasterAccountAddress?: string;
+  approvedAgentAddresses?: readonly string[];
+  browserStoredAgents?: readonly BrowserStoredAgentCandidate[];
+}): Hex | undefined {
+  const configuredAgentKey = normalizeHexPrivateKey(options.configuredAgentKey);
+  const configuredMasterAccountAddress = normalizeHexAddress(options.configuredMasterAccountAddress)?.toLowerCase();
+  const approvedAgentAddresses = normalizeAddressList(options.approvedAgentAddresses);
+
+  if (approvedAgentAddresses.length === 0) {
+    const firstBrowserKey = options.browserStoredAgents
+      ?.map((candidate) => normalizeHexPrivateKey(candidate.privateKey))
+      .find((candidate): candidate is Hex => Boolean(candidate));
+    if (firstBrowserKey) {
+      return firstBrowserKey;
+    }
+
+    return configuredAgentKey;
+  }
+
+  for (const candidate of options.browserStoredAgents ?? []) {
+    const candidateUserAddress = normalizeHexAddress(candidate.userAddress)?.toLowerCase();
+    if (configuredMasterAccountAddress && candidateUserAddress && candidateUserAddress !== configuredMasterAccountAddress) {
+      continue;
+    }
+
+    const normalizedPrivateKey = normalizeHexPrivateKey(candidate.privateKey);
+    const normalizedAgentAddress = candidateAgentAddress(candidate);
+    if (normalizedPrivateKey && normalizedAgentAddress && approvedAgentAddresses.includes(normalizedAgentAddress)) {
+      return normalizedPrivateKey;
+    }
+  }
+
+  if (configuredAgentKey) {
+    const configuredAddress = privateKeyToAccount(configuredAgentKey).address.toLowerCase();
+    if (approvedAgentAddresses.includes(configuredAddress)) {
+      return configuredAgentKey;
+    }
+  }
+
+  return undefined;
+}
+
+function emptyAgentSessionStatus(config: AppConfig): AgentSessionStatus {
+  return {
+    masterAccountAddress: normalizeHexAddress(config.valiantMasterAccountAddress)?.toLowerCase(),
+    approvedAgentAddress: null,
+    activeAgentAddress: null,
+    envFallbackAgentAddress: normalizeHexPrivateKey(config.valiantAgentKey)
+      ? privateKeyToAccount(normalizeHexPrivateKey(config.valiantAgentKey)!).address.toLowerCase()
+      : null,
+    approvalStatus: "missing",
+    lastCheckedAt: null,
+    lastSyncAt: null,
+    lastError: null
+  };
+}
+
 function aggressiveMarketPrice(referencePrice: number, isBuy: boolean): number {
   const multiplier = 1 + HYPERLIQUID_MARKET_SLIPPAGE_BPS / 10_000;
   return isBuy ? referencePrice * multiplier : referencePrice / multiplier;
@@ -229,6 +329,41 @@ function aggressiveProtectionPrice(referencePrice: number, isBuy: boolean): numb
   return isBuy ? referencePrice * multiplier : referencePrice / multiplier;
 }
 
+function formatMissingAgentRoleMessage(agentAddress: Hex): string {
+  return [
+    `VALIANT_AGENT_KEY resolves to ${agentAddress}, but Hyperliquid userRole returned "missing".`,
+    "This API wallet/agent is not currently approved on the trading account.",
+    "Re-approve the agent wallet on Hyperliquid or replace VALIANT_AGENT_KEY with the currently approved agent private key."
+  ].join(" ");
+}
+
+export function isRetryableHyperliquidAuthFailure(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("user or api wallet")
+    && normalized.includes("does not exist")
+  ) || normalized.includes('userrole returned "missing"');
+}
+
+function extractHyperliquidOrderErrors(statuses: unknown): string[] {
+  if (!Array.isArray(statuses)) {
+    return [];
+  }
+
+  return statuses.flatMap((status) => {
+    if (!status || typeof status !== "object") {
+      return [];
+    }
+
+    const error = (status as { error?: unknown }).error;
+    if (typeof error === "string" && error.trim()) {
+      return [error.trim()];
+    }
+
+    return [];
+  });
+}
+
 function newCloid(): `0x${string}` {
   return `0x${randomBytes(16).toString("hex")}` as `0x${string}`;
 }
@@ -236,6 +371,25 @@ function newCloid(): `0x${string}` {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
+  });
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
   });
 }
 
@@ -280,6 +434,55 @@ export function resolvePlaywrightExecutablePath(configuredPath?: string): string
   return candidates.find((candidate) => existsSync(candidate));
 }
 
+export function parseDevToolsActivePortFile(contents: string): string | undefined {
+  const lines = contents
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return undefined;
+  }
+
+  const firstLine = lines[0];
+  if (/^https?:\/\//iu.test(firstLine) || /^wss?:\/\//iu.test(firstLine)) {
+    return firstLine;
+  }
+
+  if (!/^\d+$/u.test(firstLine)) {
+    return undefined;
+  }
+
+  const path = lines[1];
+  if (path?.startsWith("/devtools/")) {
+    return `ws://127.0.0.1:${firstLine}${path}`;
+  }
+
+  return `http://127.0.0.1:${firstLine}`;
+}
+
+export function resolvePlaywrightLiveCdpEndpoint(configuredUrl?: string, profileDir?: string): string | undefined {
+  const configured = configuredUrl?.trim();
+  if (configured) {
+    return configured;
+  }
+
+  const normalizedProfileDir = profileDir?.trim();
+  if (!normalizedProfileDir) {
+    return undefined;
+  }
+
+  const devToolsActivePortPath = resolve(normalizedProfileDir, "DevToolsActivePort");
+  if (!existsSync(devToolsActivePortPath)) {
+    return undefined;
+  }
+
+  try {
+    return parseDevToolsActivePortFile(readFileSync(devToolsActivePortPath, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
 class DryRunValiantExecutor implements ExecutionAdapter {
   public async placeEntry(request: ExecutionRequest): Promise<ExecutionResult> {
     return {
@@ -318,6 +521,23 @@ class DryRunValiantExecutor implements ExecutionAdapter {
   public async applyProfitAction(request: ProfitActionRequest): Promise<ExecutionResult> {
     return accepted("OPEN", { action: "applyProfitAction", request });
   }
+
+  public async syncAgentSession(): Promise<AgentSessionStatus> {
+    return {
+      ...emptyAgentSessionStatus({
+        valiantMasterAccountAddress: undefined,
+        valiantAgentKey: undefined
+      } as AppConfig),
+      approvalStatus: "ready",
+      lastCheckedAt: new Date().toISOString(),
+      lastSyncAt: new Date().toISOString(),
+      lastError: null
+    };
+  }
+
+  public async getAgentSessionStatus(): Promise<AgentSessionStatus> {
+    return this.syncAgentSession();
+  }
 }
 
 interface HyperliquidAssetDescriptor {
@@ -336,6 +556,7 @@ interface HyperliquidResolvedPosition {
   side: TradeSide;
   size: number;
   entryPrice: number;
+  leverage: number | null;
   markPrice: number | null;
   unrealizedPnl: number | null;
 }
@@ -347,17 +568,26 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
   private exchange?: ExchangeClient;
   private info?: InfoClient;
   private wallet?: ReturnType<typeof privateKeyToAccount>;
+  private activeAgentKey?: Hex;
   private resolvedAccountAddress?: Promise<Hex>;
+  private readonly nonceState = new Map<string, number>();
   private readonly assetCache = new Map<string, Promise<HyperliquidAssetDescriptor>>();
+  private agentSessionStatus: AgentSessionStatus;
+  private browserAgentDiscoveryError: string | null = null;
 
-  public constructor(private readonly config: AppConfig) {}
+  public constructor(private readonly config: AppConfig) {
+    this.agentSessionStatus = emptyAgentSessionStatus(config);
+  }
 
   private baseUrl(): string {
     return inferValiantPrivateApiBaseUrl(this.config.valiantPrivateApiBaseUrl, this.config.valiantBaseUrl);
   }
 
   private isConfigured(): boolean {
-    return Boolean(normalizeHexPrivateKey(this.config.valiantAgentKey));
+    return Boolean(
+      normalizeHexAddress(this.config.valiantMasterAccountAddress)
+      || normalizeHexPrivateKey(this.config.valiantAgentKey)
+    );
   }
 
   private walletClient(): ReturnType<typeof privateKeyToAccount> {
@@ -365,13 +595,482 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
       return this.wallet;
     }
 
-    const privateKey = normalizeHexPrivateKey(this.config.valiantAgentKey);
-    if (!privateKey) {
-      throw new Error("Private transport is not authenticated. Set VALIANT_AGENT_KEY to a 32-byte hex private key.");
+    throw new Error("Private transport wallet is not initialized");
+  }
+
+  private configuredAgentKey(): Hex | undefined {
+    return normalizeHexPrivateKey(this.config.valiantAgentKey);
+  }
+
+  private activeAgentAddress(): string | null {
+    if (this.wallet) {
+      return this.wallet.address.toLowerCase();
+    }
+    if (this.activeAgentKey) {
+      return privateKeyToAccount(this.activeAgentKey).address.toLowerCase();
+    }
+    return null;
+  }
+
+  private updateAgentSessionStatus(patch: Partial<AgentSessionStatus>): AgentSessionStatus {
+    this.agentSessionStatus = {
+      ...this.agentSessionStatus,
+      ...patch,
+      masterAccountAddress: patch.masterAccountAddress ?? this.agentSessionStatus.masterAccountAddress
+        ?? normalizeHexAddress(this.config.valiantMasterAccountAddress)?.toLowerCase(),
+      envFallbackAgentAddress: patch.envFallbackAgentAddress ?? this.agentSessionStatus.envFallbackAgentAddress
+        ?? emptyAgentSessionStatus(this.config).envFallbackAgentAddress
+    };
+    return { ...this.agentSessionStatus };
+  }
+
+  private blockingAgentError(status: AgentSessionStatus): string {
+    return status.lastError
+      ?? "No approved Valiant agent is loaded in memory. Run Sync Agent or open the canonical Valiant browser profile.";
+  }
+
+  private async approvedAgentAddresses(masterAccountAddress: Hex): Promise<string[]> {
+    const approvedAgents = await this.infoClient().extraAgents({ user: masterAccountAddress });
+    const now = Date.now();
+    return normalizeAddressList(
+      approvedAgents
+        .filter((agent) => !agent.validUntil || agent.validUntil >= now)
+        .map((agent) => agent.address)
+    );
+  }
+
+  private makeTempProfileDir(): string {
+    const path = join(tmpdir(), `valiant-agent-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    mkdirSync(join(path, "Default"), { recursive: true });
+    return path;
+  }
+
+  private copyIfExists(from: string, to: string): void {
+    if (!existsSync(from)) {
+      return;
+    }
+    cpSync(from, to, { recursive: true, force: true });
+  }
+
+  private hasValiantStorage(profileRoot: string): boolean {
+    return existsSync(join(profileRoot, "Default", "IndexedDB", "https_valiant.trade_0.indexeddb.leveldb"))
+      && existsSync(join(profileRoot, "Default", "Local Storage", "leveldb"));
+  }
+
+  private async openValiantPage(context: BrowserContext): Promise<Page> {
+    const marketUrl = resolveValiantMarketUrl(this.config.valiantBaseUrl, this.config.valiantMarketRoute);
+    const targetOrigin = new URL(marketUrl).origin;
+    const existingPage = context.pages().find((page) => {
+      try {
+        return new URL(page.url()).origin === targetOrigin;
+      } catch {
+        return false;
+      }
+    });
+
+    const page = existingPage ?? await context.newPage();
+    if (!existingPage || page.url() !== marketUrl) {
+      await page.goto(marketUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: 30_000
+      });
     }
 
-    this.wallet = privateKeyToAccount(privateKey);
+    return page;
+  }
+
+  private async collectBrowserStoredAgents(page: Page): Promise<BrowserStoredAgentCandidate[]> {
+    const storedAgents = await page.evaluate(`
+      (async () => {
+        const DB_NAME = "valiant-agent-keys";
+        const STORE_NAME = "encryption-keys";
+        const STORAGE_PREFIX = "valiant:agent:";
+        const ADDR_PREFIX = "valiant:agent-addr:";
+
+        const openDb = () => new Promise((resolve, reject) => {
+          const request = indexedDB.open(DB_NAME, 1);
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error ?? new Error("Failed to open Valiant agent key database"));
+        });
+
+        const unwrapCryptoKey = (value) => {
+          if (value instanceof CryptoKey) {
+            return value;
+          }
+          if (
+            value
+            && typeof value === "object"
+            && "key" in value
+            && value.key instanceof CryptoKey
+          ) {
+            return value.key;
+          }
+          return undefined;
+        };
+
+        const readStore = async () => {
+          const db = await openDb();
+          return await new Promise((resolve, reject) => {
+            const transaction = db.transaction(STORE_NAME, "readonly");
+            const store = transaction.objectStore(STORE_NAME);
+            const keysRequest = store.getAllKeys();
+            const valuesRequest = store.getAll();
+
+            transaction.oncomplete = () => {
+              const keys = Array.isArray(keysRequest.result) ? keysRequest.result : [];
+              const values = Array.isArray(valuesRequest.result) ? valuesRequest.result : [];
+              resolve(
+                keys
+                  .map((key, index) => {
+                    const cryptoKey = unwrapCryptoKey(values[index]);
+                    if (!cryptoKey) {
+                      return undefined;
+                    }
+                    return {
+                      key: String(key),
+                      cryptoKey
+                    };
+                  })
+                  .filter(Boolean)
+              );
+              db.close();
+            };
+            transaction.onerror = () => {
+              reject(transaction.error ?? new Error("Failed to read Valiant encryption keys"));
+              db.close();
+            };
+          });
+        };
+
+        const decryptPrivateKey = async (cryptoKey, encrypted) => {
+          const bytes = Uint8Array.from(atob(encrypted), (char) => char.charCodeAt(0));
+          const iv = bytes.slice(0, 12);
+          const ciphertext = bytes.slice(12);
+          const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, cryptoKey, ciphertext);
+          return new TextDecoder().decode(decrypted);
+        };
+
+        const keyEntries = await readStore();
+        const results = [];
+
+        for (const entry of keyEntries) {
+          const encrypted = localStorage.getItem(STORAGE_PREFIX + entry.key.toLowerCase());
+          if (!encrypted) {
+            continue;
+          }
+
+          try {
+            const privateKey = await decryptPrivateKey(entry.cryptoKey, encrypted);
+            const agentAddress = localStorage.getItem(ADDR_PREFIX + entry.key.toLowerCase()) ?? undefined;
+            results.push({
+              userAddress: entry.key,
+              agentAddress: agentAddress ?? undefined,
+              privateKey
+            });
+          } catch {
+          }
+        }
+
+        return results;
+      })()
+    `);
+
+    return Array.isArray(storedAgents) ? storedAgents : [];
+  }
+
+  private async extractBrowserStoredAgentsFromLiveSession(cdpEndpoint: string): Promise<BrowserStoredAgentCandidate[]> {
+    const browser = await withTimeout(
+      chromium.connectOverCDP(cdpEndpoint),
+      VALIANT_AGENT_DISCOVERY_TIMEOUT_MS,
+      `Connecting to the live Valiant browser session at ${cdpEndpoint}`
+    );
+    try {
+      const context = browser.contexts()[0];
+      if (!context) {
+        throw new Error(`Connected to the live canonical browser at ${cdpEndpoint}, but no browser context was available.`);
+      }
+
+      const page = await withTimeout(
+        this.openValiantPage(context),
+        VALIANT_AGENT_DISCOVERY_TIMEOUT_MS,
+        `Opening the Valiant page in the live browser session at ${cdpEndpoint}`
+      );
+      return await withTimeout(
+        this.collectBrowserStoredAgents(page),
+        VALIANT_AGENT_DISCOVERY_TIMEOUT_MS,
+        `Reading Valiant agent storage from the live browser session at ${cdpEndpoint}`
+      );
+    } finally {
+      await browser.close().catch(() => undefined);
+    }
+  }
+
+  private async extractBrowserStoredAgentsFromCopiedProfile(profileRoot: string, executablePath: string): Promise<BrowserStoredAgentCandidate[]> {
+    const tempProfileDir = this.makeTempProfileDir();
+    this.copyIfExists(join(profileRoot, "Local State"), join(tempProfileDir, "Local State"));
+    this.copyIfExists(join(profileRoot, "Default", "Local Storage"), join(tempProfileDir, "Default", "Local Storage"));
+    this.copyIfExists(join(profileRoot, "Default", "IndexedDB"), join(tempProfileDir, "Default", "IndexedDB"));
+
+    let context: BrowserContext | undefined;
+    try {
+      context = await chromium.launchPersistentContext(tempProfileDir, {
+        executablePath,
+        headless: this.config.valiantPlaywrightHeadless ?? false
+      });
+      const page = await this.openValiantPage(context);
+      return this.collectBrowserStoredAgents(page);
+    } finally {
+      await context?.close().catch(() => undefined);
+      rmSync(tempProfileDir, { recursive: true, force: true });
+    }
+  }
+
+  private async browserStoredAgents(): Promise<BrowserStoredAgentCandidate[]> {
+    this.browserAgentDiscoveryError = null;
+    const executablePath = resolvePlaywrightExecutablePath(this.config.valiantPlaywrightExecutablePath);
+    if (!executablePath) {
+      this.browserAgentDiscoveryError = "No Chrome/Chromium/Brave executable is available for Valiant agent discovery.";
+      return [];
+    }
+
+    const canonicalProfileRoot = resolve(this.config.valiantPlaywrightProfileDir);
+    if (!this.hasValiantStorage(canonicalProfileRoot)) {
+      this.browserAgentDiscoveryError = `The canonical Valiant browser profile ${canonicalProfileRoot} does not contain Valiant IndexedDB/local storage yet.`;
+      return [];
+    }
+
+    const discoveryErrors: string[] = [];
+    const liveCdpEndpoint = resolvePlaywrightLiveCdpEndpoint(
+      this.config.valiantPlaywrightCdpUrl,
+      canonicalProfileRoot
+    );
+
+    if (liveCdpEndpoint) {
+      try {
+        const liveAgents = await this.extractBrowserStoredAgentsFromLiveSession(liveCdpEndpoint);
+        if (liveAgents.length > 0) {
+          return liveAgents;
+        }
+        discoveryErrors.push(`Attached to the live canonical browser session at ${liveCdpEndpoint}, but no decryptable Valiant agents were found.`);
+      } catch (error) {
+        discoveryErrors.push(`Live canonical browser attach failed at ${liveCdpEndpoint}: ${extractErrorMessage(error)}`);
+      }
+    } else {
+      discoveryErrors.push(
+        `No live canonical browser debugging endpoint was found for ${canonicalProfileRoot}. Set VALIANT_PLAYWRIGHT_CDP_URL or launch Brave with --remote-debugging-port.`
+      );
+    }
+
+    try {
+      const copiedProfileAgents = await this.extractBrowserStoredAgentsFromCopiedProfile(canonicalProfileRoot, executablePath);
+      if (copiedProfileAgents.length > 0) {
+        return copiedProfileAgents;
+      }
+      discoveryErrors.push("Copied-profile Valiant agent extraction found no decryptable agents.");
+    } catch (error) {
+      discoveryErrors.push(`Copied-profile Valiant agent extraction failed: ${extractErrorMessage(error)}`);
+    }
+
+    this.browserAgentDiscoveryError = discoveryErrors.join(" | ");
+    return [];
+  }
+
+  private applyActiveAgentKey(agentKey: Hex): ReturnType<typeof privateKeyToAccount> {
+    if (this.wallet && this.activeAgentKey === agentKey) {
+      return this.wallet;
+    }
+
+    this.activeAgentKey = agentKey;
+    this.wallet = privateKeyToAccount(agentKey);
+    this.exchange = undefined;
+    this.resolvedAccountAddress = undefined;
+    this.nonceState.clear();
+    this.updateAgentSessionStatus({
+      activeAgentAddress: this.wallet.address.toLowerCase(),
+      lastError: null
+    });
     return this.wallet;
+  }
+
+  private async inspectAgentSession(): Promise<AgentSessionStatus> {
+    const checkedAt = new Date().toISOString();
+    const baseStatus = emptyAgentSessionStatus(this.config);
+    this.updateAgentSessionStatus(baseStatus);
+
+    try {
+      const configuredMasterAccount = normalizeHexAddress(this.config.valiantMasterAccountAddress);
+      if (!configuredMasterAccount) {
+        const fallbackWallet = this.configuredAgentKey();
+        if (fallbackWallet) {
+          const wallet = this.applyActiveAgentKey(fallbackWallet);
+          return this.updateAgentSessionStatus({
+            activeAgentAddress: wallet.address.toLowerCase(),
+            approvalStatus: "ready",
+            lastCheckedAt: checkedAt,
+            lastError: null
+          });
+        }
+
+        return this.updateAgentSessionStatus({
+          approvalStatus: "missing",
+          lastCheckedAt: checkedAt,
+          lastError: "VALIANT_MASTER_ACCOUNT_ADDRESS is required for dynamic agent sync."
+        });
+      }
+
+      const approvedAgentAddresses = await this.approvedAgentAddresses(configuredMasterAccount);
+      const approvedAgentAddress = approvedAgentAddresses[0] ?? null;
+      const activeAgentAddress = this.activeAgentAddress();
+      const envFallbackAgentAddress = baseStatus.envFallbackAgentAddress;
+
+      if (!approvedAgentAddress) {
+        return this.updateAgentSessionStatus({
+          approvedAgentAddress,
+          activeAgentAddress,
+          envFallbackAgentAddress,
+          approvalStatus: "missing",
+          lastCheckedAt: checkedAt,
+          lastError: `No approved Valiant agent is currently registered for ${configuredMasterAccount}.`
+        });
+      }
+
+      if (activeAgentAddress && approvedAgentAddresses.includes(activeAgentAddress)) {
+        return this.updateAgentSessionStatus({
+          approvedAgentAddress,
+          activeAgentAddress,
+          envFallbackAgentAddress,
+          approvalStatus: "ready",
+          lastCheckedAt: checkedAt,
+          lastError: null
+        });
+      }
+
+      const staleReason = envFallbackAgentAddress
+        ? `VALIANT_AGENT_KEY resolves to ${envFallbackAgentAddress}, but it is not the currently approved Valiant agent. Approved agent addresses for ${configuredMasterAccount}: ${approvedAgentAddresses.join(", ")}.`
+        : `No approved in-memory Valiant agent is loaded. Approved agent addresses for ${configuredMasterAccount}: ${approvedAgentAddresses.join(", ")}.`;
+
+      return this.updateAgentSessionStatus({
+        approvedAgentAddress,
+        activeAgentAddress,
+        envFallbackAgentAddress,
+        approvalStatus: "stale",
+        lastCheckedAt: checkedAt,
+        lastError: staleReason
+      });
+    } catch (error) {
+      return this.updateAgentSessionStatus({
+        approvalStatus: "error",
+        lastCheckedAt: checkedAt,
+        lastError: extractErrorMessage(error)
+      });
+    }
+  }
+
+  public async getAgentSessionStatus(): Promise<AgentSessionStatus> {
+    return this.inspectAgentSession();
+  }
+
+  public async syncAgentSession(): Promise<AgentSessionStatus> {
+    const checkedAt = new Date().toISOString();
+
+    try {
+      const configuredMasterAccount = normalizeHexAddress(this.config.valiantMasterAccountAddress);
+      if (!configuredMasterAccount) {
+        const fallbackKey = this.configuredAgentKey();
+        if (!fallbackKey) {
+          return this.updateAgentSessionStatus({
+            approvalStatus: "missing",
+            lastCheckedAt: checkedAt,
+            lastError: "Cannot sync agent without VALIANT_MASTER_ACCOUNT_ADDRESS or VALIANT_AGENT_KEY fallback."
+          });
+        }
+
+        const wallet = this.applyActiveAgentKey(fallbackKey);
+        return this.updateAgentSessionStatus({
+          activeAgentAddress: wallet.address.toLowerCase(),
+          approvalStatus: "synced",
+          lastCheckedAt: checkedAt,
+          lastSyncAt: checkedAt,
+          lastError: null
+        });
+      }
+
+      const approvedAgentAddresses = await this.approvedAgentAddresses(configuredMasterAccount);
+      const browserStoredAgents = await this.browserStoredAgents();
+      const selectedAgentKey = selectApprovedAgentPrivateKey({
+        configuredAgentKey: this.config.valiantAgentKey,
+        configuredMasterAccountAddress: configuredMasterAccount,
+        approvedAgentAddresses,
+        browserStoredAgents
+      });
+
+      if (!selectedAgentKey) {
+        return this.updateAgentSessionStatus({
+          approvedAgentAddress: approvedAgentAddresses[0] ?? null,
+          activeAgentAddress: this.activeAgentAddress(),
+          approvalStatus: approvedAgentAddresses.length > 0 ? "stale" : "missing",
+          lastCheckedAt: checkedAt,
+          lastError: approvedAgentAddresses.length > 0
+            ? this.browserAgentDiscoveryError
+              ?? `Could not load the approved agent ${approvedAgentAddresses[0]} from the canonical Valiant browser profile ${resolve(this.config.valiantPlaywrightProfileDir)}.`
+            : `No approved Valiant agent is currently registered for ${configuredMasterAccount}.`,
+          lastSyncAt: null
+        });
+      }
+
+      const wallet = this.applyActiveAgentKey(selectedAgentKey);
+      return this.updateAgentSessionStatus({
+        approvedAgentAddress: approvedAgentAddresses[0] ?? wallet.address.toLowerCase(),
+        activeAgentAddress: wallet.address.toLowerCase(),
+        approvalStatus: "synced",
+        lastCheckedAt: checkedAt,
+        lastSyncAt: checkedAt,
+        lastError: null
+      });
+    } catch (error) {
+      return this.updateAgentSessionStatus({
+        approvalStatus: "error",
+        lastCheckedAt: checkedAt,
+        lastError: extractErrorMessage(error)
+      });
+    }
+  }
+
+  private async ensureWalletClient(forceBrowserRefresh = false): Promise<ReturnType<typeof privateKeyToAccount>> {
+    if (this.wallet && this.activeAgentKey && !forceBrowserRefresh) {
+      return this.wallet;
+    }
+
+    const syncedStatus = await this.syncAgentSession();
+    if (!this.wallet) {
+      throw new Error(this.blockingAgentError(syncedStatus));
+    }
+
+    return this.wallet;
+  }
+
+  private async ensureWritableAgentSession(): Promise<void> {
+    const configuredMasterAccount = normalizeHexAddress(this.config.valiantMasterAccountAddress);
+    if (configuredMasterAccount) {
+      const syncedStatus = await this.syncAgentSession();
+      if (syncedStatus.approvalStatus === "ready" || syncedStatus.approvalStatus === "synced") {
+        return;
+      }
+
+      throw new Error(this.blockingAgentError(syncedStatus));
+    }
+
+    const status = await this.inspectAgentSession();
+    if (status.approvalStatus === "ready") {
+      return;
+    }
+
+    const syncedStatus = await this.syncAgentSession();
+    if (syncedStatus.approvalStatus === "ready" || syncedStatus.approvalStatus === "synced") {
+      return;
+    }
+
+    throw new Error(this.blockingAgentError(syncedStatus));
   }
 
   private transportClient(): HttpTransport {
@@ -394,9 +1093,26 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
 
     this.exchange = new ExchangeClient({
       transport: this.transportClient(),
-      wallet: this.walletClient()
+      wallet: this.walletClient(),
+      nonceManager: (address) => this.nextNonce(address)
     });
     return this.exchange;
+  }
+
+  private nextNonce(address: string): number {
+    const now = Date.now();
+
+    for (const [key, lastNonce] of this.nonceState) {
+      if (now > lastNonce) {
+        this.nonceState.delete(key);
+      }
+    }
+
+    const key = `${address.toLowerCase()}:${this.transportClient().isTestnet}`;
+    const lastNonce = this.nonceState.get(key) ?? 0;
+    const nonce = now > lastNonce ? now : lastNonce + 1;
+    this.nonceState.set(key, nonce);
+    return nonce;
   }
 
   private infoClient(): InfoClient {
@@ -409,26 +1125,44 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
   }
 
   private async resolveTradingAccountAddress(): Promise<Hex> {
-    const agentAddress = this.walletClient().address.toLowerCase() as Hex;
+    const configuredMasterAccount = normalizeHexAddress(this.config.valiantMasterAccountAddress);
+    if (configuredMasterAccount) {
+      return configuredMasterAccount.toLowerCase() as Hex;
+    }
 
-    try {
-      const role = (await this.infoClient().userRole({ user: agentAddress })) as UserRoleResponse;
-      if (role.role === "agent") {
-        return role.data.user.toLowerCase() as Hex;
-      }
-      if (role.role === "subAccount") {
-        return role.data.master.toLowerCase() as Hex;
-      }
-    } catch {
-      return agentAddress;
+    const agentAddress = (await this.ensureWalletClient()).address.toLowerCase() as Hex;
+
+    const role = (await this.infoClient().userRole({ user: agentAddress })) as UserRoleResponse;
+    if (role.role === "agent") {
+      return role.data.user.toLowerCase() as Hex;
+    }
+    if (role.role === "subAccount") {
+      return role.data.master.toLowerCase() as Hex;
+    }
+    if (role.role === "missing") {
+      throw new Error(formatMissingAgentRoleMessage(agentAddress));
     }
 
     return agentAddress;
   }
 
+  private resetCachedState(): void {
+    this.transport = undefined;
+    this.exchange = undefined;
+    this.info = undefined;
+    this.wallet = undefined;
+    this.activeAgentKey = undefined;
+    this.resolvedAccountAddress = undefined;
+    this.nonceState.clear();
+    this.assetCache.clear();
+  }
+
   private async tradingAccountAddress(): Promise<Hex> {
     if (!this.resolvedAccountAddress) {
-      this.resolvedAccountAddress = this.resolveTradingAccountAddress();
+      this.resolvedAccountAddress = this.resolveTradingAccountAddress().catch((error) => {
+        this.resolvedAccountAddress = undefined;
+        throw error;
+      });
     }
     return this.resolvedAccountAddress;
   }
@@ -481,6 +1215,7 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
           side: size > 0 ? "LONG" : "SHORT",
           size: Math.abs(size),
           entryPrice: Number.parseFloat(entry.position.entryPx),
+          leverage: Number.isFinite(Number(entry.position.leverage?.value)) ? Number(entry.position.leverage.value) : null,
           markPrice: parsePositiveNumber(entry.position.positionValue) && Math.abs(size) > 0
             ? Number.parseFloat(entry.position.positionValue) / Math.abs(size)
             : null,
@@ -492,11 +1227,13 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
       .filter((entry): entry is HyperliquidResolvedPosition => Boolean(entry));
   }
 
-  private async waitForLivePosition(symbol: string): Promise<HyperliquidResolvedPosition | undefined> {
+  private async waitForLivePosition(symbol: string, expectedSide?: TradeSide): Promise<HyperliquidResolvedPosition | undefined> {
     const normalizedSymbol = symbol.toUpperCase();
 
     for (let attempt = 0; attempt < HYPERLIQUID_POSITION_SYNC_RETRIES; attempt += 1) {
-      const livePosition = (await this.livePositions()).find((entry) => entry.symbol === normalizedSymbol);
+      const livePosition = (await this.livePositions()).find(
+        (entry) => entry.symbol === normalizedSymbol && (!expectedSide || entry.side === expectedSide)
+      );
       if (livePosition) {
         return livePosition;
       }
@@ -504,6 +1241,30 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
     }
 
     return undefined;
+  }
+
+  private async waitForPositionSizeChange(
+    symbol: string,
+    side: TradeSide,
+    previousSize: number,
+    szDecimals: number
+  ): Promise<HyperliquidResolvedPosition | undefined> {
+    const normalizedSymbol = symbol.toUpperCase();
+    const tolerance = 1 / 10 ** Math.max(szDecimals, 0);
+    let latestPosition: HyperliquidResolvedPosition | undefined;
+
+    for (let attempt = 0; attempt < HYPERLIQUID_POSITION_SYNC_RETRIES; attempt += 1) {
+      latestPosition = (await this.livePositions()).find(
+        (entry) => entry.symbol === normalizedSymbol && entry.side === side
+      );
+      const currentSize = latestPosition?.size ?? 0;
+      if (Math.abs(currentSize - previousSize) >= tolerance) {
+        return latestPosition;
+      }
+      await sleep(HYPERLIQUID_POSITION_SYNC_DELAY_MS);
+    }
+
+    return latestPosition;
   }
 
   private async frontendOpenOrders(symbol?: string): Promise<HyperliquidOpenOrder[]> {
@@ -535,6 +1296,25 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
     }
 
     return targets;
+  }
+
+  private async waitForProtectionTargets(
+    symbol: string,
+    takeProfit: number,
+    stopLoss: number,
+    szDecimals: number
+  ): Promise<{ takeProfit?: number; stopLoss?: number }> {
+    let latestTargets: { takeProfit?: number; stopLoss?: number } = {};
+
+    for (let attempt = 0; attempt < HYPERLIQUID_POSITION_SYNC_RETRIES; attempt += 1) {
+      latestTargets = this.currentProtectionTargets(await this.frontendOpenOrders(symbol));
+      if (this.protectionMatches(latestTargets, takeProfit, stopLoss, szDecimals)) {
+        return latestTargets;
+      }
+      await sleep(HYPERLIQUID_POSITION_SYNC_DELAY_MS);
+    }
+
+    return latestTargets;
   }
 
   private protectionMatches(
@@ -647,7 +1427,7 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
       await this.cancelOrders(existingProtectionOrders);
     }
 
-    const livePosition = await this.waitForLivePosition(symbol);
+    const livePosition = await this.waitForLivePosition(symbol, side);
     const protectionSize = roundDown(livePosition?.size ?? fallbackSize, asset.szDecimals);
     if (!(protectionSize > 0)) {
       return {
@@ -680,6 +1460,22 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
       ],
       grouping: "positionTpsl"
     });
+
+    const protectionErrors = extractHyperliquidOrderErrors(protectionResponse.response.data.statuses);
+    if (protectionErrors.length > 0) {
+      return {
+        status: "failed",
+        reason: `Hyperliquid rejected the ${symbol.toUpperCase()} TP/SL update: ${protectionErrors.join(" | ")}`
+      };
+    }
+
+    const refreshedTargets = await this.waitForProtectionTargets(symbol, takeProfit, stopLoss, asset.szDecimals);
+    if (!this.protectionMatches(refreshedTargets, takeProfit, stopLoss, asset.szDecimals)) {
+      return {
+        status: "failed",
+        reason: `Could not confirm ${symbol.toUpperCase()} TP/SL orders on Hyperliquid`
+      };
+    }
 
     return accepted("OPEN", {
       adapter: "hyperliquid",
@@ -757,11 +1553,33 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
 
   private async withExecutionResult(work: () => Promise<ExecutionResult>): Promise<ExecutionResult> {
     try {
+      if (this.isConfigured()) {
+        await this.ensureWritableAgentSession();
+      }
       return await work();
     } catch (error) {
+      const firstFailureReason = this.explainApiError(error);
+      if (isRetryableHyperliquidAuthFailure(firstFailureReason)) {
+        this.resetCachedState();
+        try {
+          if (this.isConfigured()) {
+            const syncedStatus = await this.syncAgentSession();
+            if (syncedStatus.approvalStatus !== "ready" && syncedStatus.approvalStatus !== "synced") {
+              throw new Error(this.blockingAgentError(syncedStatus));
+            }
+          }
+          return await work();
+        } catch (retryError) {
+          return {
+            status: "failed",
+            reason: this.explainApiError(retryError)
+          };
+        }
+      }
+
       return {
         status: "failed",
-        reason: this.explainApiError(error)
+        reason: firstFailureReason
       };
     }
   }
@@ -771,7 +1589,7 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
       if (!this.isConfigured()) {
         return {
           status: "failed",
-          reason: "Private transport is not authenticated. Set VALIANT_AGENT_KEY to a 32-byte hex private key."
+          reason: "Private transport is not authenticated. Configure VALIANT_MASTER_ACCOUNT_ADDRESS and VALIANT_PLAYWRIGHT_PROFILE_DIR, or keep VALIANT_AGENT_KEY as an emergency fallback."
         };
       }
 
@@ -863,6 +1681,14 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
 
   public async moveStopLoss(position: PositionState, stopLoss: number): Promise<ExecutionResult> {
     return this.withExecutionResult(async () => {
+      const livePosition = await this.waitForLivePosition(position.symbol, position.side);
+      if (!livePosition) {
+        return {
+          status: "failed",
+          reason: `No live ${position.symbol.toUpperCase()} ${position.side} position found while moving the stop loss`
+        };
+      }
+
       const openOrders = await this.frontendOpenOrders(position.symbol);
       const currentTargets = this.currentProtectionTargets(openOrders);
       return this.placeProtectionOrders({
@@ -881,22 +1707,42 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
       const asset = await this.asset(position.symbol);
       const openOrders = await this.frontendOpenOrders(position.symbol);
       const currentTargets = this.currentProtectionTargets(openOrders);
-      const livePosition = (await this.waitForLivePosition(position.symbol)) ?? {
-        symbol: position.symbol.toUpperCase(),
-        side: position.side,
-        size: position.currentSize,
-        entryPrice: position.entryPrice
-      };
+      const livePosition = await this.waitForLivePosition(position.symbol, position.side);
+      if (!livePosition) {
+        return {
+          status: "failed",
+          reason: `No live ${position.symbol.toUpperCase()} ${position.side} position found while closing 30%`
+        };
+      }
+
       const closeSize = this.orderSize((livePosition.size * percent) / 100, 1, asset.szDecimals);
       const { result } = await this.placeReduceOnlyMarketOrder(position.symbol, position.side, closeSize);
       if (result.status !== "accepted") {
         return result;
       }
 
-      await sleep(HYPERLIQUID_POSITION_SYNC_DELAY_MS);
+      const remainingPosition = await this.waitForPositionSizeChange(
+        position.symbol,
+        position.side,
+        livePosition.size,
+        asset.szDecimals
+      );
+      const remainingSize = remainingPosition?.size ?? 0;
+      if (remainingPosition && remainingSize >= livePosition.size) {
+        return {
+          status: "failed",
+          reason: `The live ${position.symbol.toUpperCase()} position size did not decrease after the partial close`
+        };
+      }
+      if (!remainingPosition && livePosition.size > closeSize) {
+        return {
+          status: "failed",
+          reason: `The live ${position.symbol.toUpperCase()} position disappeared instead of reducing by 30%`
+        };
+      }
+
       await this.cancelProtectionOrders(position.symbol);
 
-      const remainingPosition = await this.waitForLivePosition(position.symbol);
       if (remainingPosition && remainingPosition.size > 0) {
         await this.placeProtectionOrders({
           symbol: position.symbol,
@@ -966,20 +1812,25 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
       return [];
     }
 
-    try {
-      return (await this.livePositions()).map((position) => ({
+    const [positions, openOrders] = await Promise.all([this.livePositions(), this.frontendOpenOrders()]);
+    return positions.map((position) => {
+      const protectionTargets = this.currentProtectionTargets(
+        this.protectionOrders(openOrders.filter((order) => order.coin.toUpperCase() === position.symbol))
+      );
+      return {
         symbol: position.symbol,
         side: position.side,
         size: position.size,
         entryPrice: position.entryPrice,
+        takeProfit: protectionTargets.takeProfit ?? null,
+        stopLoss: protectionTargets.stopLoss ?? null,
+        leverage: position.leverage,
         markPrice: position.markPrice,
         unrealizedPnl: position.unrealizedPnl,
         status: "OPEN",
         remotePositionId: `${position.symbol}:${position.side}`
-      }));
-    } catch {
-      return [];
-    }
+      };
+    });
   }
 
   public async applyProfitAction(request: ProfitActionRequest): Promise<ExecutionResult> {
@@ -1781,6 +2632,20 @@ class PlaywrightValiantExecutor implements ExecutionAdapter {
       });
     });
   }
+
+  public async syncAgentSession(): Promise<AgentSessionStatus> {
+    return {
+      ...emptyAgentSessionStatus(this.config),
+      approvalStatus: "missing",
+      lastCheckedAt: new Date().toISOString(),
+      lastSyncAt: null,
+      lastError: "Playwright execution does not maintain an API agent session."
+    };
+  }
+
+  public async getAgentSessionStatus(): Promise<AgentSessionStatus> {
+    return this.syncAgentSession();
+  }
 }
 
 export class HybridValiantExecutor implements ExecutionAdapter {
@@ -1811,6 +2676,33 @@ export class HybridValiantExecutor implements ExecutionAdapter {
     }
   }
 
+  private shouldTryPlaywrightFallback(method: keyof ExecutionAdapter, adapterName: string, failureReason: string): boolean {
+    return this.config.valiantExecutionMode === "private"
+      && adapterName === "private"
+      && method !== "getPositions"
+      && isRetryableHyperliquidAuthFailure(failureReason);
+  }
+
+  private async runWithPlaywrightFallback(
+    method: keyof ExecutionAdapter,
+    args: unknown[],
+    failures: string[]
+  ): Promise<ExecutionResult | null> {
+    try {
+      const fn = this.playwright[method] as (...inner: unknown[]) => Promise<ExecutionResult>;
+      const result = await fn.apply(this.playwright, args);
+      if (result.status === "accepted") {
+        return result;
+      }
+
+      failures.push(`playwright: ${result.reason ?? result.status}`);
+      return null;
+    } catch (error) {
+      failures.push(`playwright: ${extractErrorMessage(error)}`);
+      return null;
+    }
+  }
+
   private async run(method: keyof ExecutionAdapter, ...args: unknown[]): Promise<ExecutionResult> {
     const failures: string[] = [];
 
@@ -1822,9 +2714,23 @@ export class HybridValiantExecutor implements ExecutionAdapter {
           return result;
         }
 
-        failures.push(`${name}: ${result.reason ?? result.status}`);
+        const failureReason = result.reason ?? result.status;
+        failures.push(`${name}: ${failureReason}`);
+        if (this.shouldTryPlaywrightFallback(method, name, failureReason)) {
+          const fallbackResult = await this.runWithPlaywrightFallback(method, args, failures);
+          if (fallbackResult) {
+            return fallbackResult;
+          }
+        }
       } catch (error) {
-        failures.push(`${name}: ${extractErrorMessage(error)}`);
+        const failureReason = extractErrorMessage(error);
+        failures.push(`${name}: ${failureReason}`);
+        if (this.shouldTryPlaywrightFallback(method, name, failureReason)) {
+          const fallbackResult = await this.runWithPlaywrightFallback(method, args, failures);
+          if (fallbackResult) {
+            return fallbackResult;
+          }
+        }
       }
     }
 
@@ -1859,20 +2765,49 @@ export class HybridValiantExecutor implements ExecutionAdapter {
   }
 
   public async getPositions(): Promise<PositionSnapshot[]> {
+    const failures: string[] = [];
+
     for (const { adapter } of this.adapterSequence()) {
       try {
         const positions = await adapter.getPositions();
         if (positions.length > 0) {
           return positions;
         }
-      } catch {
-        // Try the next adapter.
+      } catch (error) {
+        failures.push(extractErrorMessage(error));
       }
     }
+
+    if (failures.length > 0) {
+      throw new Error(failures.join(" | "));
+    }
+
     return [];
   }
 
   public applyProfitAction(request: ProfitActionRequest): Promise<ExecutionResult> {
     return this.run("applyProfitAction", request);
+  }
+
+  public async syncAgentSession(): Promise<AgentSessionStatus> {
+    const privateAdapter = this.privateTransport as ExecutionAdapter;
+    if (privateAdapter.syncAgentSession) {
+      return privateAdapter.syncAgentSession();
+    }
+    return {
+      ...emptyAgentSessionStatus(this.config),
+      approvalStatus: "missing",
+      lastCheckedAt: new Date().toISOString(),
+      lastSyncAt: null,
+      lastError: "The configured execution adapter does not support agent sync."
+    };
+  }
+
+  public async getAgentSessionStatus(): Promise<AgentSessionStatus> {
+    const privateAdapter = this.privateTransport as ExecutionAdapter;
+    if (privateAdapter.getAgentSessionStatus) {
+      return privateAdapter.getAgentSessionStatus();
+    }
+    return this.syncAgentSession();
   }
 }

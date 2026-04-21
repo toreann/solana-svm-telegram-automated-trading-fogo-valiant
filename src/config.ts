@@ -45,10 +45,12 @@ const envSchema = z.object({
     .default("dry-run"),
   VALIANT_BASE_URL: z.string().default("https://valiant.trade"),
   VALIANT_AGENT_KEY: z.string().optional(),
+  VALIANT_MASTER_ACCOUNT_ADDRESS: z.string().optional(),
   VALIANT_PRIVATE_API_BASE_URL: z.string().optional(),
   VALIANT_PRIVATE_API_KEY: z.string().optional(),
   VALIANT_PRIVATE_API_SECRET: z.string().optional(),
   VALIANT_PLAYWRIGHT_EXECUTABLE_PATH: z.string().optional(),
+  VALIANT_PLAYWRIGHT_CDP_URL: z.string().optional(),
   VALIANT_PLAYWRIGHT_HEADLESS: z
     .string()
     .default("true")
@@ -96,10 +98,12 @@ export function loadConfig(): AppConfig {
     valiantExecutionMode: env.VALIANT_EXECUTION_MODE,
     valiantBaseUrl: env.VALIANT_BASE_URL,
     valiantAgentKey: env.VALIANT_AGENT_KEY,
+    valiantMasterAccountAddress: env.VALIANT_MASTER_ACCOUNT_ADDRESS,
     valiantPrivateApiBaseUrl: env.VALIANT_PRIVATE_API_BASE_URL,
     valiantPrivateApiKey: env.VALIANT_PRIVATE_API_KEY,
     valiantPrivateApiSecret: env.VALIANT_PRIVATE_API_SECRET,
     valiantPlaywrightExecutablePath: env.VALIANT_PLAYWRIGHT_EXECUTABLE_PATH,
+    valiantPlaywrightCdpUrl: env.VALIANT_PLAYWRIGHT_CDP_URL,
     valiantPlaywrightHeadless: env.VALIANT_PLAYWRIGHT_HEADLESS,
     valiantPlaywrightProfileDir: env.VALIANT_PLAYWRIGHT_PROFILE_DIR,
     valiantMarketRoute: env.VALIANT_MARKET_ROUTE

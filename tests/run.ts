@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
 
+import { privateKeyToAccount } from "viem/accounts";
+
 import { AppDatabase } from "../src/db.js";
 import type { Notifier } from "../src/notifier.js";
 import { TradeOrchestrator } from "../src/orchestrator.js";
 import { parseSignal } from "../src/signals/parser.js";
 import { SenderFilter } from "../src/signals/senderFilter.js";
+import { buildSelfRestartHandoffArgs, buildSelfRestartPlan } from "../src/telegram/controlBot.js";
 import type {
   AppConfig,
   ExecutionRequest,
@@ -16,13 +19,18 @@ import type {
 } from "../src/types.js";
 import type { ExecutionAdapter } from "../src/trading/executionAdapter.js";
 import {
+  HybridValiantExecutor,
   buildValiantPrivateHeaders,
   formatHyperliquidOrderPrice,
   formatHyperliquidOrderSize,
   formatValiantOrderValue,
   inferValiantPrivateApiBaseUrl,
+  isRetryableHyperliquidAuthFailure,
+  parseDevToolsActivePortFile,
   pickPreferredLeverageChoice,
-  resolveValiantMarketUrl
+  resolvePlaywrightLiveCdpEndpoint,
+  resolveValiantMarketUrl,
+  selectApprovedAgentPrivateKey
 } from "../src/trading/valiantExecutor.js";
 
 async function run(name: string, fn: () => Promise<void> | void): Promise<void> {
@@ -70,6 +78,36 @@ class MockNotifier {
     this.events.push(event.dedupeKey);
     this.notifications.push(event);
   }
+}
+
+function createAdapterStub(overrides: Partial<ExecutionAdapter>): ExecutionAdapter {
+  return {
+    async placeEntry(_request: ExecutionRequest): Promise<ExecutionResult> {
+      return { status: "failed", reason: "not implemented" };
+    },
+    async setProtectionOrders(_position: PositionState): Promise<ExecutionResult> {
+      return { status: "failed", reason: "not implemented" };
+    },
+    async moveStopLoss(_position: PositionState, _stopLoss: number): Promise<ExecutionResult> {
+      return { status: "failed", reason: "not implemented" };
+    },
+    async partialCloseReduceOnly(_position: PositionState, _percent: number): Promise<ExecutionResult> {
+      return { status: "failed", reason: "not implemented" };
+    },
+    async closePositionReduceOnly(_position: PositionState): Promise<ExecutionResult> {
+      return { status: "failed", reason: "not implemented" };
+    },
+    async cancelPendingByTicker(_symbol: string): Promise<ExecutionResult> {
+      return { status: "failed", reason: "not implemented" };
+    },
+    async getPositions(): Promise<PositionSnapshot[]> {
+      return [];
+    },
+    async applyProfitAction(_request: ProfitActionRequest): Promise<ExecutionResult> {
+      return { status: "failed", reason: "not implemented" };
+    },
+    ...overrides
+  };
 }
 
 const orchestratorConfig: AppConfig = {
@@ -170,6 +208,25 @@ await run("round fractional entry leverage written with a comma", () => {
   }
 });
 
+await run("parse leverage labels that use maxima punctuation variants", () => {
+  const entryMessage = `⚡️ LIVE\n\n🚨 NOVO SINAL | #BNB26032601V13\n\nAtivo: BNB\nDireção: 🟢 LONG\nEntrada: $589.4\n\n🎯 TP: $612.2 (3.8%)\n🛑 SL: $577.3 (2.1%)\n📊 R:R = 1:2.0\n⚡️ Alavancagem máxima.: 9,7x\n\nStatus: Aguardando confirmação`;
+  const parsed = parseSignal(entryMessage, "4c", "2026-03-26T12:00:00.000Z");
+  assert.ok(parsed);
+  assert.equal(parsed?.type, "ENTRY");
+  if (parsed?.type === "ENTRY") {
+    assert.equal(parsed.symbol, "BNB");
+    assert.equal(parsed.leverage, 10);
+  }
+});
+
+await run("reject entry signals whose rounded prices collapse into the same value", () => {
+  const entryMessage = `⚡️ LIVE\n\n🚨 NOVO SINAL | #ETH26032601V13\n\nAtivo: ETH\nDireção: 🟢 LONG\nEntrada: $100.49\n\n🎯 TP: $100.40 (0.2%)\n🛑 SL: $99.60 (0.8%)\n📊 R:R = 1:2.0\n⚡️ Alavancagem máx: 10.0x\n\nStatus: Aguardando confirmação`;
+  assert.throws(
+    () => parseSignal(entryMessage, "4d", "2026-03-26T12:00:00.000Z"),
+    /distinct values/
+  );
+});
+
 await run("parse profit messages", () => {
   const profitMessage = `LIVE\n\nLUCRO | #BNB26032601V13\n\nBNB LONG\nLucro atual: +1.0% (ou +18% com alav.)\nPreço: $625.25 -> $631.56`;
   const parsed = parseSignal(profitMessage, "2", "2026-03-26T12:00:00.000Z");
@@ -231,6 +288,172 @@ await run("prefer agent-key auth for Valiant private transport", () => {
       "x-agent-key": "agent-123"
     }
   );
+});
+
+await run("recognize retryable Hyperliquid auth failures", () => {
+  assert.equal(
+    isRetryableHyperliquidAuthFailure(
+      'Hyperliquid rejected the request: {"status":"err","response":"User or API Wallet 0xabc does not exist."}'
+    ),
+    true
+  );
+  assert.equal(
+    isRetryableHyperliquidAuthFailure(
+      'VALIANT_AGENT_KEY resolves to 0xabc, but Hyperliquid userRole returned "missing".'
+    ),
+    true
+  );
+  assert.equal(isRetryableHyperliquidAuthFailure("Price must be divisible by tick size"), false);
+});
+
+await run("parse DevToolsActivePort files into a CDP endpoint", () => {
+  assert.equal(
+    parseDevToolsActivePortFile("9222\n/devtools/browser/abc123\n"),
+    "ws://127.0.0.1:9222/devtools/browser/abc123"
+  );
+  assert.equal(
+    parseDevToolsActivePortFile("9333\n"),
+    "http://127.0.0.1:9333"
+  );
+});
+
+await run("prefer the configured live CDP endpoint over profile discovery", () => {
+  assert.equal(
+    resolvePlaywrightLiveCdpEndpoint("http://127.0.0.1:9222", "./playwright-profile"),
+    "http://127.0.0.1:9222"
+  );
+});
+
+await run("select an approved browser-stored agent key when the configured key is stale", () => {
+  const selected = selectApprovedAgentPrivateKey({
+    configuredAgentKey: `0x${"11".repeat(32)}`,
+    configuredMasterAccountAddress: "0x8811436f1d51911368ebb2072d92a1bd20e29612",
+    approvedAgentAddresses: ["0xa3f6083bcb4ad18820bf87bb6eda80baf45f87b0"],
+    browserStoredAgents: [
+      {
+        userAddress: "0x8811436f1d51911368ebb2072d92a1bd20e29612",
+        agentAddress: "0xa3f6083bcb4ad18820bf87bb6eda80baf45f87b0",
+        privateKey: `0x${"22".repeat(32)}`
+      }
+    ]
+  });
+
+  assert.equal(selected, `0x${"22".repeat(32)}`);
+});
+
+await run("prefer the configured agent key when it is already approved", () => {
+  const configuredAgentKey = `0x${"33".repeat(32)}` as `0x${string}`;
+  const selected = selectApprovedAgentPrivateKey({
+    configuredAgentKey,
+    approvedAgentAddresses: [
+      privateKeyToAccount(configuredAgentKey).address
+    ],
+    browserStoredAgents: [
+      {
+        userAddress: "0x8811436f1d51911368ebb2072d92a1bd20e29612",
+        agentAddress: "0xa3f6083bcb4ad18820bf87bb6eda80baf45f87b0",
+        privateKey: `0x${"22".repeat(32)}`
+      }
+    ]
+  });
+
+  assert.equal(selected, configuredAgentKey);
+});
+
+await run("prefer the browser-approved agent over the configured env key when both are approved", () => {
+  const configuredAgentKey = `0x${"33".repeat(32)}` as `0x${string}`;
+  const browserAgentKey = `0x${"44".repeat(32)}` as `0x${string}`;
+  const selected = selectApprovedAgentPrivateKey({
+    configuredAgentKey,
+    configuredMasterAccountAddress: "0x8811436f1d51911368ebb2072d92a1bd20e29612",
+    approvedAgentAddresses: [
+      privateKeyToAccount(configuredAgentKey).address,
+      privateKeyToAccount(browserAgentKey).address
+    ],
+    browserStoredAgents: [
+      {
+        userAddress: "0x8811436f1d51911368ebb2072d92a1bd20e29612",
+        agentAddress: privateKeyToAccount(browserAgentKey).address,
+        privateKey: browserAgentKey
+      }
+    ]
+  });
+
+  assert.equal(selected, browserAgentKey);
+});
+
+await run("fallback to Playwright when private entry auth fails in private mode", async () => {
+  const executor = new HybridValiantExecutor({
+    ...orchestratorConfig,
+    valiantExecutionMode: "private",
+    valiantAgentKey: `0x${"11".repeat(32)}`
+  });
+
+  const mutableExecutor = executor as unknown as {
+    privateTransport: ExecutionAdapter;
+    playwright: ExecutionAdapter;
+  };
+
+  let playwrightCalls = 0;
+  mutableExecutor.privateTransport = createAdapterStub({
+    async placeEntry(): Promise<ExecutionResult> {
+      return {
+        status: "failed",
+        reason: 'Hyperliquid rejected the request: {"status":"err","response":"User or API Wallet 0xabc does not exist."}'
+      };
+    }
+  });
+  mutableExecutor.playwright = createAdapterStub({
+    async placeEntry(): Promise<ExecutionResult> {
+      playwrightCalls += 1;
+      return { status: "accepted", resultingStatus: "OPEN", metadata: { adapter: "playwright" } };
+    }
+  });
+
+  const result = await executor.placeEntry({
+    symbol: "SOL",
+    side: "SHORT",
+    entryPrice: 120,
+    takeProfit: 110,
+    stopLoss: 125,
+    leverage: 5,
+    margin: 25,
+    sourceMessageId: "fallback-1"
+  });
+
+  assert.equal(result.status, "accepted");
+  assert.equal(playwrightCalls, 1);
+  assert.equal(result.metadata?.adapter, "playwright");
+});
+
+await run("build a self-restart plan from the current process command line", () => {
+  assert.deepEqual(
+    buildSelfRestartPlan("/usr/bin/node", ["./node_modules/tsx/dist/cli.mjs", "watch", "src/index.ts"], "/tmp/trade-bot"),
+    {
+      command: "/usr/bin/node",
+      args: ["./node_modules/tsx/dist/cli.mjs", "watch", "src/index.ts"],
+      cwd: "/tmp/trade-bot"
+    }
+  );
+});
+
+await run("build detached self-restart handoff args", () => {
+  const args = buildSelfRestartHandoffArgs(
+    {
+      command: "/usr/bin/node",
+      args: ["./dist/src/index.js"],
+      cwd: "/tmp/trade-bot"
+    },
+    4321
+  );
+  assert.equal(args[0], "-e");
+  assert.match(args[1] ?? "", /waitForParentExit/);
+  assert.equal(args[2], JSON.stringify({
+    command: "/usr/bin/node",
+    args: ["./dist/src/index.js"],
+    cwd: "/tmp/trade-bot"
+  }));
+  assert.equal(args[3], "4321");
 });
 
 await run("resolve symbol-aware Valiant market routes", () => {
@@ -341,6 +564,252 @@ await run("open a position for a valid entry signal", async () => {
   cleanup(dbPath);
 });
 
+await run("widen long stops to a minimum 3.5% distance from entry", async () => {
+  const dbPath = "./data/test-orchestrator.db";
+  cleanup(dbPath);
+  const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
+  const notifier = new MockNotifier();
+  const executor = new MockExecutor();
+  let capturedRequest: ExecutionRequest | undefined;
+  executor.placeEntry = async (request: ExecutionRequest): Promise<ExecutionResult> => {
+    capturedRequest = request;
+    return { status: "accepted", remoteOrderId: "order-1", remotePositionId: "position-1", resultingStatus: "OPEN" };
+  };
+  const orchestrator = new TradeOrchestrator(
+    orchestratorConfig,
+    db,
+    executor,
+    notifier as unknown as Notifier,
+    { info() {}, error() {}, warn() {} } as never
+  );
+
+  await orchestrator.handleParsedSignal(
+    {
+      type: "ENTRY",
+      symbol: "SOL",
+      side: "LONG",
+      entry: 100,
+      takeProfit: 110,
+      stopLoss: 98,
+      leverage: 10,
+      statusText: "Aguardando confirmação",
+      messageId: "m-min-stop-long",
+      messageDate: "2026-03-26T00:00:00.000Z",
+      rawText: "raw"
+    },
+    "1",
+    { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+  );
+
+  assert.equal(capturedRequest?.stopLoss, 96.5);
+  assert.equal(orchestrator.listPositions()[0]?.stopLoss, 96.5);
+  assert.match(notifier.notifications.at(-1)?.body ?? "", /adjusted from 98 to 96\.5/);
+
+  db.close();
+  cleanup(dbPath);
+});
+
+await run("widen short stops to a minimum 3.5% distance from entry", async () => {
+  const dbPath = "./data/test-orchestrator.db";
+  cleanup(dbPath);
+  const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
+  const notifier = new MockNotifier();
+  const executor = new MockExecutor();
+  let capturedRequest: ExecutionRequest | undefined;
+  executor.placeEntry = async (request: ExecutionRequest): Promise<ExecutionResult> => {
+    capturedRequest = request;
+    return { status: "accepted", remoteOrderId: "order-1", remotePositionId: "position-1", resultingStatus: "OPEN" };
+  };
+  const orchestrator = new TradeOrchestrator(
+    orchestratorConfig,
+    db,
+    executor,
+    notifier as unknown as Notifier,
+    { info() {}, error() {}, warn() {} } as never
+  );
+
+  await orchestrator.handleParsedSignal(
+    {
+      type: "ENTRY",
+      symbol: "BNB",
+      side: "SHORT",
+      entry: 100,
+      takeProfit: 90,
+      stopLoss: 101,
+      leverage: 10,
+      statusText: "Aguardando confirmação",
+      messageId: "m-min-stop-short",
+      messageDate: "2026-03-26T00:00:00.000Z",
+      rawText: "raw"
+    },
+    "1",
+    { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+  );
+
+  assert.equal(capturedRequest?.stopLoss, 103.5);
+  assert.equal(orchestrator.listPositions()[0]?.stopLoss, 103.5);
+  assert.match(notifier.notifications.at(-1)?.body ?? "", /adjusted from 101 to 103\.5/);
+
+  db.close();
+  cleanup(dbPath);
+});
+
+await run("clear stale local positions before blocking a fresh entry", async () => {
+  const dbPath = "./data/test-orchestrator.db";
+  cleanup(dbPath);
+  const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
+  const notifier = new MockNotifier();
+  const executor = new MockExecutor();
+  let placeEntryCalls = 0;
+  executor.placeEntry = async (_request: ExecutionRequest): Promise<ExecutionResult> => {
+    placeEntryCalls += 1;
+    return { status: "accepted", remoteOrderId: "order-new", remotePositionId: "position-new", resultingStatus: "OPEN" };
+  };
+  executor.getPositions = async (): Promise<PositionSnapshot[]> => [];
+
+  db.upsertPosition({
+    id: "stale-sol",
+    symbol: "SOL",
+    side: "LONG",
+    status: "OPEN",
+    entryPrice: 90,
+    currentSize: 1,
+    initialSize: 1,
+    takeProfit: 100,
+    stopLoss: 85,
+    leverage: 10,
+    margin: 25,
+    sourceMessageId: "stale-message",
+    sourceChatId: "1",
+    senderId: "42",
+    signalId: "stale",
+    remoteOrderId: "stale-order",
+    remotePositionId: "stale-position",
+    profitActionApplied: false,
+    lastError: null,
+    createdAt: "2026-03-26T00:00:00.000Z",
+    updatedAt: "2026-03-26T00:00:00.000Z"
+  });
+
+  const orchestrator = new TradeOrchestrator(
+    { ...orchestratorConfig, valiantExecutionMode: "private" },
+    db,
+    executor,
+    notifier as unknown as Notifier,
+    { info() {}, error() {}, warn() {} } as never
+  );
+
+  await orchestrator.handleParsedSignal(
+    {
+      type: "ENTRY",
+      symbol: "SOL",
+      side: "LONG",
+      entry: 100,
+      takeProfit: 110,
+      stopLoss: 95,
+      leverage: 10,
+      statusText: "Aguardando confirmação",
+      messageId: "m-fresh-sol",
+      messageDate: "2026-03-26T00:05:00.000Z",
+      rawText: "raw"
+    },
+    "1",
+    { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+  );
+
+  assert.equal(placeEntryCalls, 1);
+  const allPositions = db.listAllPositions();
+  assert.equal(allPositions.find((position) => position.id === "stale-sol")?.status, "CLOSED");
+  assert.equal(orchestrator.listPositions()[0]?.sourceMessageId, "m-fresh-sol");
+  assert.match(notifier.notifications[0]?.title ?? "", /Exchange sync updated local positions/);
+
+  db.close();
+  cleanup(dbPath);
+});
+
+await run("notify when a live/open position still blocks a new entry", async () => {
+  const dbPath = "./data/test-orchestrator.db";
+  cleanup(dbPath);
+  const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
+  const notifier = new MockNotifier();
+  const executor = new MockExecutor();
+  let placeEntryCalls = 0;
+  executor.placeEntry = async (_request: ExecutionRequest): Promise<ExecutionResult> => {
+    placeEntryCalls += 1;
+    return { status: "accepted", remoteOrderId: "order-new", remotePositionId: "position-new", resultingStatus: "OPEN" };
+  };
+  executor.getPositions = async (): Promise<PositionSnapshot[]> => ([
+    {
+      symbol: "SOL",
+      side: "LONG",
+      size: 1.2,
+      entryPrice: 95,
+      status: "OPEN"
+    }
+  ]);
+
+  db.upsertPosition({
+    id: "live-sol",
+    symbol: "SOL",
+    side: "LONG",
+    status: "OPEN",
+    entryPrice: 95,
+    currentSize: 1.2,
+    initialSize: 1.2,
+    takeProfit: 105,
+    stopLoss: 90,
+    leverage: 10,
+    margin: 25,
+    sourceMessageId: "live-message",
+    sourceChatId: "1",
+    senderId: "42",
+    signalId: "live",
+    remoteOrderId: "live-order",
+    remotePositionId: "live-position",
+    profitActionApplied: false,
+    lastError: null,
+    createdAt: "2026-03-26T00:00:00.000Z",
+    updatedAt: "2026-03-26T00:00:00.000Z"
+  });
+
+  const orchestrator = new TradeOrchestrator(
+    { ...orchestratorConfig, valiantExecutionMode: "private" },
+    db,
+    executor,
+    notifier as unknown as Notifier,
+    { info() {}, error() {}, warn() {} } as never
+  );
+
+  await orchestrator.handleParsedSignal(
+    {
+      type: "ENTRY",
+      symbol: "SOL",
+      side: "LONG",
+      entry: 100,
+      takeProfit: 110,
+      stopLoss: 95,
+      leverage: 10,
+      statusText: "Aguardando confirmação",
+      messageId: "m-blocked-sol",
+      messageDate: "2026-03-26T00:05:00.000Z",
+      rawText: "raw"
+    },
+    "1",
+    { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+  );
+
+  assert.equal(placeEntryCalls, 0);
+  assert.equal(orchestrator.listPositions().length, 1);
+  assert.equal(
+    notifier.notifications.at(-1)?.title,
+    "SOL LONG ignored"
+  );
+  assert.match(notifier.notifications.at(-1)?.body ?? "", /still exists after exchange sync/);
+
+  db.close();
+  cleanup(dbPath);
+});
+
 await run("store the leverage actually applied by the executor", async () => {
   const dbPath = "./data/test-orchestrator.db";
   cleanup(dbPath);
@@ -383,6 +852,8 @@ await run("store the leverage actually applied by the executor", async () => {
   const position = orchestrator.listPositions()[0];
   assert.equal(position?.leverage, 16);
   assert.equal(position?.currentSize, 4);
+  assert.match(notifier.notifications.at(-1)?.body ?? "", /Requested leverage: 17x/);
+  assert.match(notifier.notifications.at(-1)?.body ?? "", /Applied leverage: 16x/);
 
   db.close();
   cleanup(dbPath);
@@ -443,6 +914,15 @@ await run("reapply TP/SL for an open position", async () => {
   const notifier = new MockNotifier();
   const executor = new MockExecutor();
   let protectionAttempts = 0;
+  executor.getPositions = async (): Promise<PositionSnapshot[]> => ([
+    {
+      symbol: "SOL",
+      side: "LONG",
+      size: 1.8,
+      entryPrice: 100,
+      status: "OPEN"
+    }
+  ]);
   executor.setProtectionOrders = async (_position: PositionState): Promise<ExecutionResult> => {
     protectionAttempts += 1;
     return protectionAttempts === 1
@@ -488,15 +968,150 @@ await run("reapply TP/SL for an open position", async () => {
   cleanup(dbPath);
 });
 
+await run("reapply an entry from a stored position when no live position exists", async () => {
+  const dbPath = "./data/test-orchestrator.db";
+  cleanup(dbPath);
+  const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
+  const notifier = new MockNotifier();
+  const executor = new MockExecutor();
+  let placeEntryCalls = 0;
+  executor.getPositions = async (): Promise<PositionSnapshot[]> => [];
+  executor.placeEntry = async (_request: ExecutionRequest): Promise<ExecutionResult> => {
+    placeEntryCalls += 1;
+    return {
+      status: "accepted",
+      remoteOrderId: "order-reapplied",
+      remotePositionId: "position-reapplied",
+      resultingStatus: "OPEN",
+      metadata: { appliedLeverage: 12 }
+    };
+  };
+
+  const orchestrator = new TradeOrchestrator(
+    { ...orchestratorConfig, valiantExecutionMode: "private" },
+    db,
+    executor,
+    notifier as unknown as Notifier,
+    { info() {}, error() {}, warn() {} } as never
+  );
+
+  await orchestrator.handleParsedSignal(
+    {
+      type: "ENTRY",
+      symbol: "SOL",
+      side: "LONG",
+      entry: 100,
+      takeProfit: 110,
+      stopLoss: 95,
+      leverage: 10,
+      statusText: "Aguardando confirmação",
+      messageId: "m-reapply-entry",
+      messageDate: "2026-03-26T00:00:00.000Z",
+      rawText: "raw"
+    },
+    "1",
+    { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+  );
+
+  const original = orchestrator.listPositions()[0];
+  original.status = "CLOSED";
+  original.currentSize = 0;
+  db.upsertPosition(original);
+
+  const refreshed = await orchestrator.reapplyEntry(original.id);
+  assert.equal(placeEntryCalls, 2);
+  assert.equal(refreshed?.status, "OPEN");
+  assert.equal(refreshed?.leverage, 12);
+  assert.equal(refreshed?.remoteOrderId, "order-reapplied");
+  assert.equal(refreshed?.lastError, null);
+  assert.match(notifier.notifications.at(-1)?.title ?? "", /\[SOL\] entry reapplied/);
+
+  db.close();
+  cleanup(dbPath);
+});
+
+await run("reject reapplying an entry when a live position already exists", async () => {
+  const dbPath = "./data/test-orchestrator.db";
+  cleanup(dbPath);
+  const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
+  const notifier = new MockNotifier();
+  const executor = new MockExecutor();
+  executor.getPositions = async (): Promise<PositionSnapshot[]> => ([
+    {
+      symbol: "SOL",
+      side: "LONG",
+      size: 2.5,
+      entryPrice: 100,
+      status: "OPEN"
+    }
+  ]);
+
+  const orchestrator = new TradeOrchestrator(
+    { ...orchestratorConfig, valiantExecutionMode: "private" },
+    db,
+    executor,
+    notifier as unknown as Notifier,
+    { info() {}, error() {}, warn() {} } as never
+  );
+
+  await orchestrator.handleParsedSignal(
+    {
+      type: "ENTRY",
+      symbol: "SOL",
+      side: "LONG",
+      entry: 100,
+      takeProfit: 110,
+      stopLoss: 95,
+      leverage: 10,
+      statusText: "Aguardando confirmação",
+      messageId: "m-reapply-entry-live",
+      messageDate: "2026-03-26T00:00:00.000Z",
+      rawText: "raw"
+    },
+    "1",
+    { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+  );
+
+  const original = orchestrator.listPositions()[0];
+  original.status = "CLOSED";
+  original.currentSize = 0;
+  db.upsertPosition(original);
+
+  await assert.rejects(
+    () => orchestrator.reapplyEntry(original.id),
+    /already exists/
+  );
+
+  db.close();
+  cleanup(dbPath);
+});
+
 await run("apply the profit action only once", async () => {
   const dbPath = "./data/test-orchestrator.db";
   cleanup(dbPath);
   const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
   const notifier = new MockNotifier();
+  const executor = new MockExecutor();
+  let liveStopLoss = 90;
+  executor.getPositions = async (): Promise<PositionSnapshot[]> => ([
+    {
+      symbol: "BNB",
+      side: "LONG",
+      size: 2,
+      entryPrice: 100,
+      takeProfit: 120,
+      stopLoss: liveStopLoss,
+      status: "OPEN"
+    }
+  ]);
+  executor.moveStopLoss = async (_position: PositionState, stopLoss: number): Promise<ExecutionResult> => {
+    liveStopLoss = stopLoss;
+    return { status: "accepted", resultingStatus: "OPEN" };
+  };
   const orchestrator = new TradeOrchestrator(
     orchestratorConfig,
     db,
-    new MockExecutor(),
+    executor,
     notifier as unknown as Notifier,
     { info() {}, error() {}, warn() {} } as never
   );
@@ -556,6 +1171,208 @@ await run("apply the profit action only once", async () => {
   const position = orchestrator.listPositions()[0];
   assert.equal(position.profitActionApplied, true);
   assert.equal(position.stopLoss, 100);
+  db.close();
+  cleanup(dbPath);
+});
+
+await run("reject the profit action when no live position exists", async () => {
+  const dbPath = "./data/test-orchestrator.db";
+  cleanup(dbPath);
+  const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
+  const notifier = new MockNotifier();
+  const executor = new MockExecutor();
+  let moveStopCalls = 0;
+  let partialCloseCalls = 0;
+  executor.moveStopLoss = async (_position: PositionState, _stopLoss: number): Promise<ExecutionResult> => {
+    moveStopCalls += 1;
+    return { status: "accepted", resultingStatus: "OPEN" };
+  };
+  executor.partialCloseReduceOnly = async (_position: PositionState, _percent: number): Promise<ExecutionResult> => {
+    partialCloseCalls += 1;
+    return { status: "accepted", resultingStatus: "OPEN", metadata: { remainingSize: 1.4 } };
+  };
+
+  const orchestrator = new TradeOrchestrator(
+    { ...orchestratorConfig, valiantExecutionMode: "private" },
+    db,
+    executor,
+    notifier as unknown as Notifier,
+    { info() {}, error() {}, warn() {} } as never
+  );
+
+  await orchestrator.handleParsedSignal(
+    {
+      type: "ENTRY",
+      symbol: "BNB",
+      side: "LONG",
+      entry: 100,
+      takeProfit: 120,
+      stopLoss: 90,
+      leverage: 10,
+      statusText: "Aguardando confirmação",
+      messageId: "m-live-check",
+      messageDate: "2026-03-26T00:00:00.000Z",
+      rawText: "raw"
+    },
+    "1",
+    { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+  );
+
+  await orchestrator.handleParsedSignal(
+    {
+      type: "PROFIT",
+      symbol: "BNB",
+      side: "LONG",
+      currentProfitPct: 1,
+      leveragedProfitPct: 18,
+      priceFrom: 100,
+      priceTo: 101,
+      messageId: "m-live-check-profit",
+      messageDate: "2026-03-26T00:01:00.000Z",
+      rawText: "raw"
+    },
+    "1",
+    { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+  );
+
+  const position = orchestrator.listPositions()[0];
+  assert.equal(position.profitActionApplied, false);
+  assert.match(position.lastError ?? "", /No live BNB LONG position found/);
+  assert.equal(moveStopCalls, 0);
+  assert.equal(partialCloseCalls, 0);
+  assert.equal(notifier.notifications.at(-1)?.title, "Signal processing failed");
+
+  db.close();
+  cleanup(dbPath);
+});
+
+await run("reject moving the stop to entry when the live stop does not change", async () => {
+  const dbPath = "./data/test-orchestrator.db";
+  cleanup(dbPath);
+  const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
+  const notifier = new MockNotifier();
+  const executor = new MockExecutor();
+
+  executor.getPositions = async (): Promise<PositionSnapshot[]> => ([
+    {
+      symbol: "SOL",
+      side: "LONG",
+      size: 2.5,
+      entryPrice: 100,
+      takeProfit: 110,
+      stopLoss: 95,
+      leverage: 10,
+      status: "OPEN",
+      remotePositionId: "SOL:LONG"
+    }
+  ]);
+  executor.moveStopLoss = async (_position: PositionState, _stopLoss: number): Promise<ExecutionResult> => (
+    { status: "accepted", resultingStatus: "OPEN" }
+  );
+
+  const orchestrator = new TradeOrchestrator(
+    { ...orchestratorConfig, valiantExecutionMode: "private" },
+    db,
+    executor,
+    notifier as unknown as Notifier,
+    { info() {}, error() {}, warn() {} } as never
+  );
+
+  await orchestrator.handleParsedSignal(
+    {
+      type: "ENTRY",
+      symbol: "SOL",
+      side: "LONG",
+      entry: 100,
+      takeProfit: 110,
+      stopLoss: 95,
+      leverage: 10,
+      statusText: "Aguardando confirmação",
+      messageId: "m-manual-sl",
+      messageDate: "2026-03-26T00:00:00.000Z",
+      rawText: "raw"
+    },
+    "1",
+    { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+  );
+
+  const position = orchestrator.listPositions()[0];
+  await assert.rejects(
+    () => orchestrator.moveStopLossToEntry(position.id),
+    /stop loss did not update/
+  );
+
+  const refreshed = orchestrator.listPositions()[0];
+  assert.equal(refreshed.stopLoss, 95);
+  assert.match(refreshed.lastError ?? "", /Expected: 100/);
+
+  db.close();
+  cleanup(dbPath);
+});
+
+await run("sync positions from exchange closes stale locals and imports live positions", async () => {
+  const dbPath = "./data/test-orchestrator.db";
+  cleanup(dbPath);
+  const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
+  const notifier = new MockNotifier();
+  const executor = new MockExecutor();
+  executor.getPositions = async (): Promise<PositionSnapshot[]> => ([
+    {
+      symbol: "ETH",
+      side: "SHORT",
+      size: 0.75,
+      entryPrice: 2000,
+      takeProfit: 1900,
+      stopLoss: 2050,
+      leverage: 8,
+      status: "OPEN",
+      remotePositionId: "ETH:SHORT"
+    }
+  ]);
+  const orchestrator = new TradeOrchestrator(
+    { ...orchestratorConfig, valiantExecutionMode: "private" },
+    db,
+    executor,
+    notifier as unknown as Notifier,
+    { info() {}, error() {}, warn() {} } as never
+  );
+
+  await orchestrator.handleParsedSignal(
+    {
+      type: "ENTRY",
+      symbol: "SOL",
+      side: "LONG",
+      entry: 100,
+      takeProfit: 110,
+      stopLoss: 95,
+      leverage: 10,
+      statusText: "Aguardando confirmação",
+      messageId: "m-sync-sol",
+      messageDate: "2026-03-26T00:00:00.000Z",
+      rawText: "raw"
+    },
+    "1",
+    { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+  );
+
+  const summary = await orchestrator.syncPositionsFromExchange();
+  assert.deepEqual(summary, { synced: 0, created: 1, closed: 1 });
+
+  const positions = db.listAllPositions();
+  const closedSol = positions.find((position) => position.symbol === "SOL" && position.side === "LONG");
+  const importedEth = positions.find((position) => position.symbol === "ETH" && position.side === "SHORT");
+
+  assert.equal(closedSol?.status, "CLOSED");
+  assert.equal(closedSol?.currentSize, 0);
+  assert.equal(importedEth?.status, "OPEN");
+  assert.equal(importedEth?.entryPrice, 2000);
+  assert.equal(importedEth?.currentSize, 0.75);
+  assert.equal(importedEth?.takeProfit, 1900);
+  assert.equal(importedEth?.stopLoss, 2050);
+  assert.equal(importedEth?.leverage, 8);
+  assert.equal(importedEth?.remotePositionId, "ETH:SHORT");
+  assert.match(importedEth?.lastError ?? "", /Synced from exchange/);
+
   db.close();
   cleanup(dbPath);
 });

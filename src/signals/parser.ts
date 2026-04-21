@@ -43,8 +43,47 @@ function parseCompactDecimal(value: string): number {
   return Number.parseFloat(value.replace(",", ".").trim());
 }
 
+function requireFinitePositiveNumber(attribute: string, value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`Signal ${attribute} is invalid`);
+  }
+  return value;
+}
+
 function toSearchableText(value: string): string {
   return value.normalize("NFD").replace(/\p{M}/gu, "");
+}
+
+function parseRequiredLineValue(searchable: string, expression: RegExp, attribute: string): string {
+  const match = searchable.match(expression);
+  const value = match?.[1]?.trim();
+  if (!value) {
+    throw new Error(`Signal ${attribute} is missing`);
+  }
+  return value;
+}
+
+function validateEntrySignalAttributes(signal: ParsedEntrySignal): ParsedEntrySignal {
+  if (!signal.symbol) {
+    throw new Error("Signal symbol is missing");
+  }
+  if (!signal.statusText) {
+    throw new Error("Signal status text is missing");
+  }
+  signal.entry = requireFinitePositiveNumber("entry", signal.entry);
+  signal.takeProfit = requireFinitePositiveNumber("take profit", signal.takeProfit);
+  signal.stopLoss = requireFinitePositiveNumber("stop loss", signal.stopLoss);
+  signal.leverage = requireFinitePositiveNumber("leverage", signal.leverage);
+
+  if (signal.signalId && !signal.signalId.toUpperCase().startsWith(signal.symbol)) {
+    throw new Error(`Signal id ${signal.signalId} does not match symbol ${signal.symbol}`);
+  }
+
+  if (signal.entry === signal.takeProfit || signal.entry === signal.stopLoss || signal.takeProfit === signal.stopLoss) {
+    throw new Error("Signal entry, TP, and SL must resolve to distinct values");
+  }
+
+  return signal;
 }
 
 function parseSide(value: string): TradeSide {
@@ -72,30 +111,48 @@ export function parseSignal(text: string, messageId: string, messageDate: string
 export function parseEntrySignal(text: string, messageId: string, messageDate: string): ParsedEntrySignal {
   const searchable = toSearchableText(text);
   const signalIdMatch = searchable.match(/#([A-Z0-9]+)/i);
-  const ativoMatch = searchable.match(/Ativo:\s*([A-Z0-9]+)/i);
-  const directionMatch = searchable.match(/Direcao:\s*([^\n]+)/i);
-  const entryMatch = searchable.match(/Entrada:\s*\$?\s*([0-9][0-9.,]*)/i);
-  const tpMatch = searchable.match(/TP:\s*\$?\s*([0-9][0-9.,]*)/i);
-  const slMatch = searchable.match(/SL:\s*\$?\s*([0-9][0-9.,]*)/i);
-  const leverageMatch = searchable.match(/Alavancagem max:\s*([0-9]+(?:[.,][0-9]+)?)x/i);
-  const statusMatch = searchable.match(/Status:\s*([^\n]+)/i);
-  if (!ativoMatch || !directionMatch || !entryMatch || !tpMatch || !slMatch || !leverageMatch || !statusMatch) {
-    throw new Error("Message does not match entry signal template");
-  }
-  return {
+  const symbol = normalizeSymbol(parseRequiredLineValue(searchable, /(?:^|\n)[^\n]*Ativo:\s*([A-Z0-9]+)/i, "symbol"));
+  const side = parseSide(parseRequiredLineValue(searchable, /(?:^|\n)[^\n]*Direcao:\s*([^\n]+)/i, "direction"));
+  const entry = requireFinitePositiveNumber(
+    "entry",
+    parseRoundedPrice(parseRequiredLineValue(searchable, /(?:^|\n)[^\n]*Entrada:\s*\$?\s*([0-9][0-9.,]*)/i, "entry"))
+  );
+  const takeProfit = requireFinitePositiveNumber(
+    "take profit",
+    parseRoundedPrice(parseRequiredLineValue(searchable, /(?:^|\n)[^\n]*TP:\s*\$?\s*([0-9][0-9.,]*)/i, "take profit"))
+  );
+  const stopLoss = requireFinitePositiveNumber(
+    "stop loss",
+    parseRoundedPrice(parseRequiredLineValue(searchable, /(?:^|\n)[^\n]*SL:\s*\$?\s*([0-9][0-9.,]*)/i, "stop loss"))
+  );
+  const leverage = normalizeLeverage(
+    requireFinitePositiveNumber(
+      "leverage",
+      parseCompactDecimal(
+        parseRequiredLineValue(
+          searchable,
+          /(?:^|\n)[^\n]*Alavancagem\s+max(?:ima)?\.?:\s*([0-9]+(?:[.,][0-9]+)?)x\b/i,
+          "leverage"
+        )
+      )
+    )
+  );
+  const statusText = parseRequiredLineValue(searchable, /(?:^|\n)[^\n]*Status:\s*([^\n]+)/i, "status");
+
+  return validateEntrySignalAttributes({
     type: "ENTRY",
-    symbol: normalizeSymbol(ativoMatch[1]),
-    side: parseSide(directionMatch[1]),
-    entry: parseRoundedPrice(entryMatch[1]),
-    takeProfit: parseRoundedPrice(tpMatch[1]),
-    stopLoss: parseRoundedPrice(slMatch[1]),
-    leverage: normalizeLeverage(parseCompactDecimal(leverageMatch[1])),
-    statusText: statusMatch[1].trim(),
+    symbol,
+    side,
+    entry,
+    takeProfit,
+    stopLoss,
+    leverage,
+    statusText,
     signalId: signalIdMatch?.[1],
     messageId,
     messageDate,
     rawText: text
-  };
+  });
 }
 
 export function parseProfitSignal(text: string, messageId: string, messageDate: string): ParsedProfitSignal {

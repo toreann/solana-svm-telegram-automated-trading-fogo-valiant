@@ -106,6 +106,9 @@ export interface PositionSnapshot {
   side: TradeSide;
   size: number;
   entryPrice: number;
+  takeProfit?: number | null;
+  stopLoss?: number | null;
+  leverage?: number | null;
   markPrice?: number | null;
   unrealizedPnl?: number | null;
   status: PositionStatus;
@@ -117,6 +120,24 @@ export interface PnlSummary {
   unrealizedPnl: number;
   openPositions: number;
   closedPositions: number;
+}
+
+export type AgentApprovalStatus =
+  | "ready"
+  | "synced"
+  | "stale"
+  | "missing"
+  | "error";
+
+export interface AgentSessionStatus {
+  masterAccountAddress?: string;
+  approvedAgentAddress?: string | null;
+  activeAgentAddress?: string | null;
+  envFallbackAgentAddress?: string | null;
+  approvalStatus: AgentApprovalStatus;
+  lastCheckedAt?: string | null;
+  lastSyncAt?: string | null;
+  lastError?: string | null;
 }
 
 export interface NotificationEvent {
@@ -156,10 +177,12 @@ export interface AppConfig {
   valiantExecutionMode: ExecutionMode;
   valiantBaseUrl: string;
   valiantAgentKey?: string;
+  valiantMasterAccountAddress?: string;
   valiantPrivateApiBaseUrl?: string;
   valiantPrivateApiKey?: string;
   valiantPrivateApiSecret?: string;
   valiantPlaywrightExecutablePath?: string;
+  valiantPlaywrightCdpUrl?: string;
   valiantPlaywrightHeadless?: boolean;
   valiantPlaywrightProfileDir: string;
   valiantMarketRoute: string;

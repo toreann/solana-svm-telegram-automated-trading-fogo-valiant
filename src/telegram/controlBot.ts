@@ -1,14 +1,79 @@
+import { spawn } from "node:child_process";
+
 import type { Logger } from "pino";
 import { Markup, Telegraf, type Context, type NarrowedContext } from "telegraf";
 import type { CallbackQuery, Update } from "telegraf/types";
 
 import type { AppDatabase } from "../db.js";
 import type { TradeOrchestrator } from "../orchestrator.js";
-import type { PositionState, RuntimeConfig } from "../types.js";
+import type { AgentSessionStatus, PositionState, RuntimeConfig } from "../types.js";
 import { newId } from "../utils.js";
 
 type PromptKey = "marginPerTrade" | "maxLeverageCap" | "profitPartialClosePercent";
 type PromptState = { key: PromptKey };
+
+export interface SelfRestartPlan {
+  command: string;
+  args: string[];
+  cwd: string;
+}
+
+const SELF_RESTART_HANDOFF_SCRIPT = `
+const [payloadJson, parentPidValue] = process.argv.slice(1);
+const payload = JSON.parse(payloadJson);
+const parentPid = Number(parentPidValue);
+const { spawn } = require("node:child_process");
+
+const relaunch = () => {
+  const child = spawn(payload.command, payload.args, {
+    cwd: payload.cwd,
+    env: { ...process.env },
+    detached: true,
+    stdio: "ignore"
+  });
+  child.unref();
+  process.exit(0);
+};
+
+const waitForParentExit = () => {
+  if (!Number.isFinite(parentPid) || parentPid <= 0) {
+    relaunch();
+    return;
+  }
+
+  try {
+    process.kill(parentPid, 0);
+    setTimeout(waitForParentExit, 250);
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ESRCH") {
+      relaunch();
+      return;
+    }
+    setTimeout(waitForParentExit, 250);
+  }
+};
+
+waitForParentExit();
+`.trim();
+
+export function buildSelfRestartPlan(
+  execPath = process.execPath,
+  argv = process.argv.slice(1),
+  cwd = process.cwd()
+): SelfRestartPlan {
+  return {
+    command: execPath,
+    args: argv,
+    cwd
+  };
+}
+
+export function buildSelfRestartHandoffArgs(
+  plan: SelfRestartPlan,
+  parentPid = process.pid
+): string[] {
+  return ["-e", SELF_RESTART_HANDOFF_SCRIPT, JSON.stringify(plan), String(parentPid)];
+}
 
 function statusLabel(paused: boolean): string {
   return paused ? "PAUSED" : "ACTIVE";
@@ -36,8 +101,9 @@ function mainKeyboard(paused: boolean) {
   return Markup.inlineKeyboard([
     [Markup.button.callback("Status", "menu:status"), Markup.button.callback("Positions", "menu:positions")],
     [Markup.button.callback("Configs", "menu:configs"), Markup.button.callback("P&L", "menu:pnl")],
-    [Markup.button.callback("Reset Positions", "positions:reset")],
-    [Markup.button.callback(paused ? "Resume" : "Pause", "menu:toggle")]
+    [Markup.button.callback("Sync Agent", "agent:sync"), Markup.button.callback("Check Agent Approval", "agent:check")],
+    [Markup.button.callback("Reset Positions", "positions:reset"), Markup.button.callback("Sync From Exchange", "positions:sync")],
+    [Markup.button.callback(paused ? "Resume" : "Pause", "menu:toggle"), Markup.button.callback("Restart Bot", "bot:restart")]
   ]);
 }
 
@@ -47,7 +113,9 @@ function configKeyboard() {
     [Markup.button.callback("Leverage cap", "config:maxLeverageCap")],
     [Markup.button.callback("Partial close %", "config:profitPartialClosePercent")],
     [Markup.button.callback("Dry-run on/off", "config:dryRun")],
-    [Markup.button.callback("Reset Positions", "positions:reset")],
+    [Markup.button.callback("Sync Agent", "agent:sync"), Markup.button.callback("Check Agent Approval", "agent:check")],
+    [Markup.button.callback("Reset Positions", "positions:reset"), Markup.button.callback("Sync From Exchange", "positions:sync")],
+    [Markup.button.callback("Restart Bot", "bot:restart")],
     [Markup.button.callback("Back", "menu:home")]
   ]);
 }
@@ -58,11 +126,33 @@ function positionsKeyboard(positions: PositionState[]) {
       Markup.button.callback(`Close ${position.symbol}`, `position:close:${position.id}`),
       Markup.button.callback(`Move SL ${position.symbol}`, `position:sl:${position.id}`)
     ],
-    [Markup.button.callback(`Reapply TP/SL ${position.symbol}`, `position:tpsl:${position.id}`)]
+    [
+      Markup.button.callback(`Reapply TP/SL ${position.symbol}`, `position:tpsl:${position.id}`),
+      Markup.button.callback(`Reapply Entry ${position.symbol}`, `position:entry:${position.id}`)
+    ]
   ]);
   rows.push([Markup.button.callback("Reset Positions", "positions:reset")]);
+  rows.push([Markup.button.callback("Sync From Exchange", "positions:sync")]);
+  rows.push([Markup.button.callback("Sync Agent", "agent:sync"), Markup.button.callback("Check Agent Approval", "agent:check")]);
+  rows.push([Markup.button.callback("Restart Bot", "bot:restart")]);
   rows.push([Markup.button.callback("Back", "menu:home")]);
   return Markup.inlineKeyboard(rows);
+}
+
+function formatAgentStatus(status: AgentSessionStatus): string {
+  const tradingState = status.approvalStatus === "ready" || status.approvalStatus === "synced" ? "GREEN" : "BLOCKED";
+  return [
+    "*Agent Approval*",
+    `Trading state: *${tradingState}*`,
+    `Approval status: *${status.approvalStatus}*`,
+    `Master account: ${status.masterAccountAddress ?? "n/a"}`,
+    `Approved exchange agent: ${status.approvedAgentAddress ?? "n/a"}`,
+    `Active in-memory agent: ${status.activeAgentAddress ?? "n/a"}`,
+    `Env fallback agent: ${status.envFallbackAgentAddress ?? "n/a"}`,
+    `Last checked: ${status.lastCheckedAt ?? "n/a"}`,
+    `Last synced: ${status.lastSyncAt ?? "n/a"}`,
+    `Last error: ${status.lastError ?? "none"}`
+  ].join("\n");
 }
 
 function isAuthorized(ctx: Context, ownerChatId: string, ownerUserId: string): boolean {
@@ -125,6 +215,22 @@ export class TelegramControlBot {
 
     this.bot.command("resetpositions", async (ctx) => {
       await this.resetPositionsAndConfirm(ctx);
+    });
+
+    this.bot.command("syncpositions", async (ctx) => {
+      await this.syncPositionsAndConfirm(ctx);
+    });
+
+    this.bot.command("restartbot", async (ctx) => {
+      await ctx.reply(await this.requestSelfRestart("command"));
+    });
+
+    this.bot.command("syncagent", async (ctx) => {
+      await this.syncAgentAndConfirm(ctx);
+    });
+
+    this.bot.command("checkagent", async (ctx) => {
+      await this.checkAgentAndConfirm(ctx);
     });
 
     this.bot.on("text", async (ctx, next) => {
@@ -280,6 +386,27 @@ export class TelegramControlBot {
       return;
     }
 
+    if (callback === "positions:sync") {
+      await this.syncPositionsAndConfirm(ctx);
+      await this.renderMenu(ctx);
+      return;
+    }
+
+    if (callback === "agent:sync") {
+      await this.syncAgentAndConfirm(ctx);
+      return;
+    }
+
+    if (callback === "agent:check") {
+      await this.checkAgentAndConfirm(ctx);
+      return;
+    }
+
+    if (callback === "bot:restart") {
+      await ctx.reply(await this.requestSelfRestart("button"));
+      return;
+    }
+
     if (callback.startsWith("position:close:")) {
       const positionId = callback.split(":")[2];
       await orchestrator.closePosition(positionId);
@@ -298,6 +425,52 @@ export class TelegramControlBot {
       const positionId = callback.split(":")[2];
       await orchestrator.reapplyProtectionOrders(positionId);
       await ctx.reply("TP/SL reapplied for the current position.");
+      return;
+    }
+
+    if (callback.startsWith("position:entry:")) {
+      const positionId = callback.split(":")[2];
+      const position = await orchestrator.reapplyEntry(positionId);
+      if (!position) {
+        await ctx.reply("Could not find that position locally.");
+        return;
+      }
+      await ctx.reply(
+        position.lastError
+          ? `Entry reapplied, but there was a TP/SL warning:\n\n${position.lastError}`
+          : "Entry reapplied for the current position."
+      );
+      return;
+    }
+  }
+
+  private async requestSelfRestart(source: "button" | "command"): Promise<string> {
+    const plan = buildSelfRestartPlan();
+    try {
+      const handoff = spawn(process.execPath, buildSelfRestartHandoffArgs(plan), {
+        cwd: plan.cwd,
+        env: { ...process.env },
+        detached: true,
+        stdio: "ignore"
+      });
+      handoff.unref();
+      this.database.appendControlAction(
+        newId(),
+        "bot_restart",
+        JSON.stringify({ source, pid: handoff.pid ?? null, command: plan.command, args: plan.args, handoff: true }),
+        "requested"
+      );
+      setTimeout(() => {
+        process.kill(process.pid, "SIGTERM");
+      }, 500);
+      return handoff.pid
+        ? `Restart requested. Spawned self-restart handoff ${handoff.pid} and shutting this one down.`
+        : "Restart requested. Spawned a self-restart handoff and shutting this one down.";
+    } catch (error) {
+      const reason = String(error);
+      this.database.appendControlAction(newId(), "bot_restart", JSON.stringify({ source, error: reason }), "failed");
+      this.logger.error({ error, source, plan }, "Failed to self-restart the bot");
+      throw new Error(`Could not self-restart the bot.\n\n${reason}`);
     }
   }
 
@@ -317,5 +490,50 @@ export class TelegramControlBot {
         ? "No active local positions to reset."
         : `Reset ${resetCount} local position${resetCount === 1 ? "" : "s"}. This only clears local bot state, not live Valiant orders.`
     );
+  }
+
+  private async syncPositionsAndConfirm(ctx: Context): Promise<void> {
+    try {
+      const summary = await this.getOrchestrator().syncPositionsFromExchange();
+      this.database.appendControlAction(newId(), "positions_sync", JSON.stringify(summary), "success");
+      await ctx.reply(
+        [
+          "Exchange sync complete.",
+          `Updated existing positions: ${summary.synced}`,
+          `Imported new positions: ${summary.created}`,
+          `Closed stale local positions: ${summary.closed}`
+        ].join("\n")
+      );
+    } catch (error) {
+      this.database.appendControlAction(
+        newId(),
+        "positions_sync",
+        JSON.stringify({ error: String(error) }),
+        "failed"
+      );
+      await ctx.reply(`Exchange sync failed.\n\n${String(error)}`);
+    }
+  }
+
+  private async syncAgentAndConfirm(ctx: Context): Promise<void> {
+    try {
+      const status = await this.getOrchestrator().syncAgentSession();
+      this.database.appendControlAction(newId(), "agent_sync", JSON.stringify(status), "success");
+      await ctx.reply(formatAgentStatus(status), { parse_mode: "Markdown" });
+    } catch (error) {
+      this.database.appendControlAction(newId(), "agent_sync", JSON.stringify({ error: String(error) }), "failed");
+      await ctx.reply(`Agent sync failed.\n\n${String(error)}`);
+    }
+  }
+
+  private async checkAgentAndConfirm(ctx: Context): Promise<void> {
+    try {
+      const status = await this.getOrchestrator().getAgentSessionStatus();
+      this.database.appendControlAction(newId(), "agent_check", JSON.stringify(status), "success");
+      await ctx.reply(formatAgentStatus(status), { parse_mode: "Markdown" });
+    } catch (error) {
+      this.database.appendControlAction(newId(), "agent_check", JSON.stringify({ error: String(error) }), "failed");
+      await ctx.reply(`Agent approval check failed.\n\n${String(error)}`);
+    }
   }
 }

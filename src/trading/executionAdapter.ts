@@ -1,4 +1,5 @@
 import type {
+  AgentSessionStatus,
   ExecutionRequest,
   ExecutionResult,
   PositionSnapshot,
@@ -15,4 +16,6 @@ export interface ExecutionAdapter {
   cancelPendingByTicker(symbol: string): Promise<ExecutionResult>;
   getPositions(): Promise<PositionSnapshot[]>;
   applyProfitAction(request: ProfitActionRequest): Promise<ExecutionResult>;
-}
+  syncAgentSession?(): Promise<AgentSessionStatus>;
+  getAgentSessionStatus?(): Promise<AgentSessionStatus>;
+} 
