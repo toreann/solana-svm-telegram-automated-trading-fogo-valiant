@@ -48,6 +48,12 @@ export interface ParsedProfitSignal extends ParsedSignalBase {
 
 export type ParsedSignal = ParsedEntrySignal | ParsedProfitSignal;
 
+export interface RetryPositioningPayload {
+  signal: ParsedEntrySignal;
+  chatId: string;
+  sender: SenderIdentity;
+}
+
 export interface PositionState {
   id: string;
   symbol: string;
@@ -122,6 +128,16 @@ export interface PnlSummary {
   closedPositions: number;
 }
 
+export interface AccountBalance {
+  accountValue: number;
+  perpsBalance?: number | null;
+  openPositionNotional?: number | null;
+  totalMarginUsed?: number | null;
+  withdrawable?: number | null;
+  currency: "USDC";
+  fetchedAt: string;
+}
+
 export type AgentApprovalStatus =
   | "ready"
   | "synced"
@@ -151,6 +167,7 @@ export interface NotificationEvent {
   title: string;
   body: string;
   dedupeKey: string;
+  retryPositioning?: RetryPositioningPayload;
 }
 
 export interface AllowedSenderRule {

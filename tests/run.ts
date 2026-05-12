@@ -4,11 +4,12 @@ import { rmSync } from "node:fs";
 import { privateKeyToAccount } from "viem/accounts";
 
 import { AppDatabase } from "../src/db.js";
+import { Notifier as TelegramNotifier } from "../src/notifier.js";
 import type { Notifier } from "../src/notifier.js";
 import { TradeOrchestrator } from "../src/orchestrator.js";
 import { parseSignal } from "../src/signals/parser.js";
 import { SenderFilter } from "../src/signals/senderFilter.js";
-import { buildSelfRestartHandoffArgs, buildSelfRestartPlan } from "../src/telegram/controlBot.js";
+import { buildSelfRestartHandoffArgs, buildSelfRestartPlan, formatBalanceLine } from "../src/telegram/controlBot.js";
 import type {
   AppConfig,
   ExecutionRequest,
@@ -30,7 +31,8 @@ import {
   pickPreferredLeverageChoice,
   resolvePlaywrightLiveCdpEndpoint,
   resolveValiantMarketUrl,
-  selectApprovedAgentPrivateKey
+  selectApprovedAgentPrivateKey,
+  walletNotConnectedMessage
 } from "../src/trading/valiantExecutor.js";
 
 async function run(name: string, fn: () => Promise<void> | void): Promise<void> {
@@ -156,34 +158,34 @@ await run("parse entry messages", () => {
   if (parsed.type === "ENTRY") {
     assert.equal(parsed.symbol, "BTC");
     assert.equal(parsed.side, "LONG");
-    assert.equal(parsed.entry, 68497);
-    assert.equal(parsed.takeProfit, 71059);
-    assert.equal(parsed.stopLoss, 67216);
+    assert.equal(parsed.entry, 68497.25);
+    assert.equal(parsed.takeProfit, 71059.05);
+    assert.equal(parsed.stopLoss, 67216.35);
     assert.equal(parsed.leverage, 20);
   }
 });
 
-await run("round entry prices to the nearest whole number", () => {
+await run("preserve fractional entry prices", () => {
   const entryMessage = `⚡️ LIVE\n\n🚨 NOVO SINAL | #ETH26032601V13\n\nAtivo: ETH\nDireção: 🟢 LONG\nEntrada: $1,999.56\n\n🎯 TP: $2,200.32 (10.04%)\n🛑 SL: $1,899.18 (5.02%)\n📊 R:R = 1:2.0\n⚡️ Alavancagem máx: 10.0x\n\nStatus: Aguardando confirmação`;
   const parsed = parseSignal(entryMessage, "1b", "2026-03-26T12:00:00.000Z");
   assert.ok(parsed);
   assert.equal(parsed?.type, "ENTRY");
   if (parsed?.type === "ENTRY") {
-    assert.equal(parsed.entry, 2000);
-    assert.equal(parsed.takeProfit, 2200);
-    assert.equal(parsed.stopLoss, 1899);
+    assert.equal(parsed.entry, 1999.56);
+    assert.equal(parsed.takeProfit, 2200.32);
+    assert.equal(parsed.stopLoss, 1899.18);
   }
 });
 
-await run("round entry prices that use comma decimals", () => {
+await run("preserve entry prices that use comma decimals", () => {
   const entryMessage = `⚡️ LIVE\n\n🚨 NOVO SINAL | #ETH26032601V13\n\nAtivo: ETH\nDireção: 🟢 LONG\nEntrada: $1.999,56\n\n🎯 TP: $2.200,32 (10,04%)\n🛑 SL: $1.899,18 (5,02%)\n📊 R:R = 1:2.0\n⚡️ Alavancagem máx: 10,0x\n\nStatus: Aguardando confirmação`;
   const parsed = parseSignal(entryMessage, "1c", "2026-03-26T12:00:00.000Z");
   assert.ok(parsed);
   assert.equal(parsed?.type, "ENTRY");
   if (parsed?.type === "ENTRY") {
-    assert.equal(parsed.entry, 2000);
-    assert.equal(parsed.takeProfit, 2200);
-    assert.equal(parsed.stopLoss, 1899);
+    assert.equal(parsed.entry, 1999.56);
+    assert.equal(parsed.takeProfit, 2200.32);
+    assert.equal(parsed.stopLoss, 1899.18);
     assert.equal(parsed.leverage, 10);
   }
 });
@@ -219,12 +221,16 @@ await run("parse leverage labels that use maxima punctuation variants", () => {
   }
 });
 
-await run("reject entry signals whose rounded prices collapse into the same value", () => {
+await run("preserve close fractional prices instead of collapsing them", () => {
   const entryMessage = `⚡️ LIVE\n\n🚨 NOVO SINAL | #ETH26032601V13\n\nAtivo: ETH\nDireção: 🟢 LONG\nEntrada: $100.49\n\n🎯 TP: $100.40 (0.2%)\n🛑 SL: $99.60 (0.8%)\n📊 R:R = 1:2.0\n⚡️ Alavancagem máx: 10.0x\n\nStatus: Aguardando confirmação`;
-  assert.throws(
-    () => parseSignal(entryMessage, "4d", "2026-03-26T12:00:00.000Z"),
-    /distinct values/
-  );
+  const parsed = parseSignal(entryMessage, "4d", "2026-03-26T12:00:00.000Z");
+  assert.ok(parsed);
+  assert.equal(parsed?.type, "ENTRY");
+  if (parsed?.type === "ENTRY") {
+    assert.equal(parsed.entry, 100.49);
+    assert.equal(parsed.takeProfit, 100.4);
+    assert.equal(parsed.stopLoss, 99.6);
+  }
 });
 
 await run("parse profit messages", () => {
@@ -304,6 +310,25 @@ await run("recognize retryable Hyperliquid auth failures", () => {
     true
   );
   assert.equal(isRetryableHyperliquidAuthFailure("Price must be divisible by tick size"), false);
+});
+
+await run("format a clean wallet not connected message", () => {
+  assert.equal(walletNotConnectedMessage(), "Wallet not connected.");
+});
+
+await run("format Telegram account balance from the perps balance, not open position notional", () => {
+  assert.equal(
+    formatBalanceLine({
+      accountValue: 130.25,
+      perpsBalance: 125.5,
+      openPositionNotional: 5_000,
+      totalMarginUsed: 50,
+      withdrawable: 75.5,
+      currency: "USDC",
+      fetchedAt: "2026-03-26T12:00:00.000Z"
+    }),
+    "Account balance: *$125.50 USDC*"
+  );
 });
 
 await run("parse DevToolsActivePort files into a CDP endpoint", () => {
@@ -528,6 +553,58 @@ await run("reject non-allowed senders", async () => {
   cleanup(dbPath);
 });
 
+await run("attach a retry positioning button to retryable notifications", async () => {
+  const dbPath = "./data/test-notifier.db";
+  cleanup(dbPath);
+  const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
+  let sentMessage:
+    | { chatId: string; text: string; extra: Record<string, unknown> | undefined }
+    | undefined;
+  const controlBot = {
+    telegram: {
+      async sendMessage(chatId: string, text: string, extra?: Record<string, unknown>): Promise<void> {
+        sentMessage = { chatId, text, extra };
+      }
+    }
+  };
+  const notifier = new TelegramNotifier(db, controlBot as never, "1");
+
+  await notifier.notify({
+    type: "ENTRY_REJECTED",
+    title: "ETH SHORT rejected",
+    body: "Entry signal m-retry was rejected.",
+    dedupeKey: "retry-button-test",
+    retryPositioning: {
+      signal: {
+        type: "ENTRY",
+        symbol: "SOL",
+        side: "LONG",
+        entry: 100,
+        takeProfit: 110,
+        stopLoss: 95,
+        leverage: 10,
+        statusText: "Aguardando confirmação",
+        messageId: "m-retry",
+        messageDate: "2026-03-26T00:00:00.000Z",
+        rawText: "raw"
+      },
+      chatId: "1",
+      sender: { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+    }
+  });
+
+  assert.equal(sentMessage?.chatId, "1");
+  assert.match(sentMessage?.text ?? "", /ETH SHORT rejected/);
+  const keyboard = sentMessage?.extra?.reply_markup as { inline_keyboard?: Array<Array<{ text: string; callback_data: string }>> } | undefined;
+  assert.equal(keyboard?.inline_keyboard?.[0]?.[0]?.text, "Retry positioning");
+  const actionId = keyboard?.inline_keyboard?.[0]?.[0]?.callback_data?.split(":")[2];
+  assert.ok(actionId);
+  assert.equal(db.getControlActionById(actionId ?? "")?.actionType, "retry_positioning");
+
+  db.close();
+  cleanup(dbPath);
+});
+
 await run("open a position for a valid entry signal", async () => {
   const dbPath = "./data/test-orchestrator.db";
   cleanup(dbPath);
@@ -560,6 +637,53 @@ await run("open a position for a valid entry signal", async () => {
   );
 
   assert.equal(orchestrator.listPositions().length, 1);
+  db.close();
+  cleanup(dbPath);
+});
+
+await run("retry positioning replays an entry even if the message was already processed", async () => {
+  const dbPath = "./data/test-orchestrator.db";
+  cleanup(dbPath);
+  const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
+  const notifier = new MockNotifier();
+  const executor = new MockExecutor();
+  let placeEntryCalls = 0;
+  executor.placeEntry = async (_request: ExecutionRequest): Promise<ExecutionResult> => {
+    placeEntryCalls += 1;
+    return { status: "accepted", remoteOrderId: "order-1", remotePositionId: "position-1", resultingStatus: "OPEN" };
+  };
+  const orchestrator = new TradeOrchestrator(
+    orchestratorConfig,
+    db,
+    executor,
+    notifier as unknown as Notifier,
+    { info() {}, error() {}, warn() {} } as never
+  );
+  const signal = {
+    type: "ENTRY" as const,
+    symbol: "SOL",
+    side: "LONG" as const,
+    entry: 100,
+    takeProfit: 110,
+    stopLoss: 95,
+    leverage: 10,
+    statusText: "Aguardando confirmação",
+    messageId: "m-retry-positioning",
+    messageDate: "2026-03-26T00:00:00.000Z",
+    rawText: "raw"
+  };
+  db.markMessageProcessed(signal, "1", "42");
+
+  const outcome = await orchestrator.retryPositioning(
+    signal,
+    "1",
+    { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+  );
+
+  assert.equal(outcome.status, "accepted");
+  assert.equal(placeEntryCalls, 1);
+  assert.equal(orchestrator.listPositions().length, 1);
+
   db.close();
   cleanup(dbPath);
 });

@@ -1,3 +1,4 @@
+import { newId } from "./utils.js";
 import type { Telegraf } from "telegraf";
 
 import type { AppDatabase } from "./db.js";
@@ -17,7 +18,31 @@ export class Notifier {
     }
 
     try {
-      await this.controlBot.telegram.sendMessage(this.ownerChatId, `${event.title}\n\n${event.body}`);
+      const extra = (() => {
+        if (!event.retryPositioning) {
+          return undefined;
+        }
+
+        const actionId = newId();
+        this.database.appendControlAction(
+          actionId,
+          "retry_positioning",
+          JSON.stringify(event.retryPositioning),
+          "pending"
+        );
+        return {
+          reply_markup: {
+            inline_keyboard: [[
+              {
+                text: "Retry positioning",
+                callback_data: `retry:positioning:${actionId}`
+              }
+            ]]
+          }
+        };
+      })();
+
+      await this.controlBot.telegram.sendMessage(this.ownerChatId, `${event.title}\n\n${event.body}`, extra);
     } catch (error) {
       console.error("Failed to deliver Telegram notification", error);
     }

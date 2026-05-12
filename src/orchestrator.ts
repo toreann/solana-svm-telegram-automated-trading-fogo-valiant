@@ -3,6 +3,7 @@ import type { Logger } from "pino";
 import type { AppDatabase } from "./db.js";
 import type { Notifier } from "./notifier.js";
 import type {
+  AccountBalance,
   AgentSessionStatus,
   AppConfig,
   ExecutionRequest,
@@ -20,6 +21,10 @@ import { newId, nowIso, round } from "./utils.js";
 import type { ExecutionAdapter } from "./trading/executionAdapter.js";
 
 const MIN_ENTRY_STOP_DISTANCE_PCT = 0.035;
+type EntryHandlingOutcome = {
+  status: "accepted" | "rejected" | "ignored";
+  reason?: string;
+};
 
 export class TradeOrchestrator {
   public constructor(
@@ -192,6 +197,14 @@ export class TradeOrchestrator {
     };
   }
 
+  public async getAccountBalance(): Promise<AccountBalance | null> {
+    if (!this.executor.getAccountBalance) {
+      return null;
+    }
+
+    return this.executor.getAccountBalance();
+  }
+
   public async getAgentSessionStatus(): Promise<AgentSessionStatus> {
     if (!this.executor.getAgentSessionStatus) {
       return {
@@ -245,9 +258,22 @@ export class TradeOrchestrator {
         type: "ERROR",
         title: "Signal processing failed",
         body: `Message ${signal.messageId} could not be processed.\n\nReason: ${String(error)}`,
-        dedupeKey: `error:${signal.messageId}`
+        dedupeKey: `error:${signal.messageId}`,
+        retryPositioning: signal.type === "ENTRY"
+          ? {
+              signal,
+              chatId,
+              sender
+            }
+          : undefined
       });
     }
+  }
+
+  public async retryPositioning(signal: ParsedEntrySignal, chatId: string, sender: SenderIdentity): Promise<EntryHandlingOutcome> {
+    const outcome = await this.handleEntrySignal({ ...signal }, chatId, sender);
+    this.database.markMessageProcessed(signal, chatId, sender.telegramUserId);
+    return outcome;
   }
 
   private validateSymbol(symbol: string): void {
@@ -403,7 +429,11 @@ export class TradeOrchestrator {
     throw new Error(position.lastError);
   }
 
-  private async handleEntrySignal(signal: ParsedEntrySignal, chatId: string, sender: SenderIdentity): Promise<void> {
+  private async handleEntrySignal(
+    signal: ParsedEntrySignal,
+    chatId: string,
+    sender: SenderIdentity
+  ): Promise<EntryHandlingOutcome> {
     const runtimeConfig = this.database.getRuntimeConfig();
     if (runtimeConfig.paused) {
       this.logger.info({ signal }, "Bot is paused; skipping entry signal");
@@ -413,7 +443,10 @@ export class TradeOrchestrator {
         body: `Entry signal ${signal.messageId} was ignored because the bot is paused.`,
         dedupeKey: `entry-paused:${signal.messageId}`
       });
-      return;
+      return {
+        status: "ignored",
+        reason: "Bot is paused."
+      };
     }
 
     const adjustedStopLossFrom = this.applyMinimumStopDistance(signal);
@@ -430,7 +463,10 @@ export class TradeOrchestrator {
           body: `Entry signal ${signal.messageId} was ignored because a live/open ${signal.symbol} position still exists after exchange sync.`,
           dedupeKey: `entry-open:${signal.messageId}`
         });
-        return;
+        return {
+          status: "ignored",
+          reason: `A live/open ${signal.symbol} position already exists.`
+        };
       }
     }
 
@@ -459,9 +495,17 @@ export class TradeOrchestrator {
         type: "ENTRY_REJECTED",
         title: `${signal.symbol} ${signal.side} rejected`,
         body: `Entry signal ${signal.messageId} was rejected.\n\nReason: ${result.reason ?? "unknown"}`,
-        dedupeKey: `entry-rejected:${signal.messageId}`
+        dedupeKey: `entry-rejected:${signal.messageId}`,
+        retryPositioning: {
+          signal,
+          chatId,
+          sender
+        }
       });
-      return;
+      return {
+        status: "rejected",
+        reason: result.reason ?? "unknown"
+      };
     }
 
     const appliedLeverage = this.resolveAppliedLeverage(signal, result);
@@ -530,6 +574,10 @@ export class TradeOrchestrator {
       ].join("\n"),
       dedupeKey: `entry:${position.id}`
     });
+    return {
+      status: "accepted",
+      reason: protectionFailureReason ?? undefined
+    };
   }
 
   private async handleProfitSignal(signal: ParsedProfitSignal): Promise<void> {

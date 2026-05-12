@@ -1,0 +1,15 @@
+[Unit]
+Description=Valiant Brave Browser Debug Session
+After=graphical-session.target
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=%h/tellegramautotrade/telegram-trading-bot-svmfogo-valiant
+EnvironmentFile=-%h/tellegramautotrade/telegram-trading-bot-svmfogo-valiant/env.env
+ExecStart=%h/tellegramautotrade/telegram-trading-bot-svmfogo-valiant/scripts/start-brave-debug.sh
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

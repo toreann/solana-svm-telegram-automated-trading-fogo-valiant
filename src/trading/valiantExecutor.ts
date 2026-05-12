@@ -16,6 +16,7 @@ import type { Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
 import type {
+  AccountBalance,
   AgentSessionStatus,
   AppConfig,
   ExecutionRequest,
@@ -61,6 +62,22 @@ function formatDecimal(value: number, maxDecimals = 8): string {
 
   const normalized = value.toFixed(maxDecimals).replace(/\.?0+$/, "");
   return normalized === "-0" ? "0" : normalized;
+}
+
+function formatPriceInput(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "0";
+  }
+
+  const normalized = value.toString();
+  if (!/[eE]/u.test(normalized)) {
+    return normalized;
+  }
+
+  return value.toLocaleString("en-US", {
+    maximumFractionDigits: 20,
+    useGrouping: false
+  });
 }
 
 function titleCaseSide(side: TradeSide): string {
@@ -212,6 +229,15 @@ function parsePositiveNumber(value: string | number | null | undefined): number 
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+function parseFiniteNumber(value: string | number | null | undefined): number | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const parsed = typeof value === "number" ? value : Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function normalizeHexPrivateKey(value?: string): Hex | undefined {
   const normalized = value?.trim();
   if (!normalized) {
@@ -335,6 +361,10 @@ function formatMissingAgentRoleMessage(agentAddress: Hex): string {
     "This API wallet/agent is not currently approved on the trading account.",
     "Re-approve the agent wallet on Hyperliquid or replace VALIANT_AGENT_KEY with the currently approved agent private key."
   ].join(" ");
+}
+
+export function walletNotConnectedMessage(): string {
+  return "Wallet not connected.";
 }
 
 export function isRetryableHyperliquidAuthFailure(message: string): boolean {
@@ -518,6 +548,10 @@ class DryRunValiantExecutor implements ExecutionAdapter {
     return [];
   }
 
+  public async getAccountBalance(): Promise<AccountBalance | null> {
+    return null;
+  }
+
   public async applyProfitAction(request: ProfitActionRequest): Promise<ExecutionResult> {
     return accepted("OPEN", { action: "applyProfitAction", request });
   }
@@ -626,7 +660,7 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
 
   private blockingAgentError(status: AgentSessionStatus): string {
     return status.lastError
-      ?? "No approved Valiant agent is loaded in memory. Run Sync Agent or open the canonical Valiant browser profile.";
+      ?? walletNotConnectedMessage();
   }
 
   private async approvedAgentAddresses(masterAccountAddress: Hex): Promise<string[]> {
@@ -1011,8 +1045,7 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
           approvalStatus: approvedAgentAddresses.length > 0 ? "stale" : "missing",
           lastCheckedAt: checkedAt,
           lastError: approvedAgentAddresses.length > 0
-            ? this.browserAgentDiscoveryError
-              ?? `Could not load the approved agent ${approvedAgentAddresses[0]} from the canonical Valiant browser profile ${resolve(this.config.valiantPlaywrightProfileDir)}.`
+            ? walletNotConnectedMessage()
             : `No approved Valiant agent is currently registered for ${configuredMasterAccount}.`,
           lastSyncAt: null
         });
@@ -1833,6 +1866,41 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
     });
   }
 
+  public async getAccountBalance(): Promise<AccountBalance | null> {
+    if (!this.isConfigured()) {
+      return null;
+    }
+
+    const user = await this.tradingAccountAddress();
+    const state = await this.infoClient().clearinghouseState({ user });
+    const parsedAccountValue =
+      parseFiniteNumber(state.marginSummary.accountValue)
+      ?? parseFiniteNumber(state.crossMarginSummary.accountValue);
+    const perpsBalance =
+      parseFiniteNumber(state.marginSummary.totalRawUsd)
+      ?? parseFiniteNumber(state.crossMarginSummary.totalRawUsd)
+      ?? parseFiniteNumber(state.withdrawable)
+      ?? parsedAccountValue;
+    const accountValue = parsedAccountValue ?? perpsBalance;
+    if (accountValue === null) {
+      return null;
+    }
+
+    return {
+      accountValue,
+      perpsBalance,
+      openPositionNotional:
+        parseFiniteNumber(state.marginSummary.totalNtlPos)
+        ?? parseFiniteNumber(state.crossMarginSummary.totalNtlPos),
+      totalMarginUsed:
+        parseFiniteNumber(state.marginSummary.totalMarginUsed)
+        ?? parseFiniteNumber(state.crossMarginSummary.totalMarginUsed),
+      withdrawable: parseFiniteNumber(state.withdrawable),
+      currency: "USDC",
+      fetchedAt: new Date().toISOString()
+    };
+  }
+
   public async applyProfitAction(request: ProfitActionRequest): Promise<ExecutionResult> {
     return accepted("OPEN", {
       adapter: "hyperliquid",
@@ -2255,7 +2323,7 @@ class PlaywrightValiantExecutor implements ExecutionAdapter {
         page.getByRole("textbox", { name: /take profit|tp/i }),
         page.getByPlaceholder(/take profit|tp/i)
       ],
-      formatDecimal(takeProfit, 4),
+      formatPriceInput(takeProfit),
       "Could not find the Take Profit input",
       3_000
     );
@@ -2267,7 +2335,7 @@ class PlaywrightValiantExecutor implements ExecutionAdapter {
         page.getByRole("textbox", { name: /stop loss|sl/i }),
         page.getByPlaceholder(/stop loss|sl/i)
       ],
-      formatDecimal(stopLoss, 4),
+      formatPriceInput(stopLoss),
       "Could not find the Stop Loss input",
       3_000
     );
@@ -2558,6 +2626,10 @@ class PlaywrightValiantExecutor implements ExecutionAdapter {
     return [];
   }
 
+  public async getAccountBalance(): Promise<AccountBalance | null> {
+    return null;
+  }
+
   public async applyProfitAction(request: ProfitActionRequest): Promise<ExecutionResult> {
     return this.runAction("applyProfitAction", request.symbol, async (page) => {
       const row = await this.findRow(page, "Positions", request.symbol, request.side);
@@ -2783,6 +2855,31 @@ export class HybridValiantExecutor implements ExecutionAdapter {
     }
 
     return [];
+  }
+
+  public async getAccountBalance(): Promise<AccountBalance | null> {
+    const failures: string[] = [];
+
+    for (const { name, adapter } of this.adapterSequence()) {
+      if (!adapter.getAccountBalance) {
+        continue;
+      }
+
+      try {
+        const balance = await adapter.getAccountBalance();
+        if (balance) {
+          return balance;
+        }
+      } catch (error) {
+        failures.push(`${name}: ${extractErrorMessage(error)}`);
+      }
+    }
+
+    if (failures.length > 0) {
+      throw new Error(failures.join(" | "));
+    }
+
+    return null;
   }
 
   public applyProfitAction(request: ProfitActionRequest): Promise<ExecutionResult> {

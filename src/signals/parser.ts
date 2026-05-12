@@ -35,10 +35,6 @@ function parsePrice(value: string): number {
   return Number.parseFloat(normalizeNumericString(value));
 }
 
-function parseRoundedPrice(value: string): number {
-  return Math.round(parsePrice(value));
-}
-
 function parseCompactDecimal(value: string): number {
   return Number.parseFloat(value.replace(",", ".").trim());
 }
@@ -115,15 +111,15 @@ export function parseEntrySignal(text: string, messageId: string, messageDate: s
   const side = parseSide(parseRequiredLineValue(searchable, /(?:^|\n)[^\n]*Direcao:\s*([^\n]+)/i, "direction"));
   const entry = requireFinitePositiveNumber(
     "entry",
-    parseRoundedPrice(parseRequiredLineValue(searchable, /(?:^|\n)[^\n]*Entrada:\s*\$?\s*([0-9][0-9.,]*)/i, "entry"))
+    parsePrice(parseRequiredLineValue(searchable, /(?:^|\n)[^\n]*Entrada:\s*\$?\s*([0-9][0-9.,]*)/i, "entry"))
   );
   const takeProfit = requireFinitePositiveNumber(
     "take profit",
-    parseRoundedPrice(parseRequiredLineValue(searchable, /(?:^|\n)[^\n]*TP:\s*\$?\s*([0-9][0-9.,]*)/i, "take profit"))
+    parsePrice(parseRequiredLineValue(searchable, /(?:^|\n)[^\n]*TP:\s*\$?\s*([0-9][0-9.,]*)/i, "take profit"))
   );
   const stopLoss = requireFinitePositiveNumber(
     "stop loss",
-    parseRoundedPrice(parseRequiredLineValue(searchable, /(?:^|\n)[^\n]*SL:\s*\$?\s*([0-9][0-9.,]*)/i, "stop loss"))
+    parsePrice(parseRequiredLineValue(searchable, /(?:^|\n)[^\n]*SL:\s*\$?\s*([0-9][0-9.,]*)/i, "stop loss"))
   );
   const leverage = normalizeLeverage(
     requireFinitePositiveNumber(

@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram Trading Bot
+Wants=valiant-brave.service
+After=valiant-brave.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/tellegramautotrade/telegram-trading-bot-svmfogo-valiant
+Environment=NODE_ENV=production
+EnvironmentFile=-%h/tellegramautotrade/telegram-trading-bot-svmfogo-valiant/env.env
+ExecStart=%h/tellegramautotrade/telegram-trading-bot-svmfogo-valiant/scripts/start-bot.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

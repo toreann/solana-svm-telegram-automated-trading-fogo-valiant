@@ -18,6 +18,13 @@ const require = createRequire(import.meta.url);
 
 type SenderRow = Omit<SenderIdentity, "isAllowed"> & { isAllowed: number };
 type PositionRow = Omit<PositionState, "profitActionApplied"> & { profitActionApplied: number };
+type ControlActionRow = {
+  id: string;
+  actionType: string;
+  payload: string;
+  status: string;
+  createdAt: string;
+};
 
 type SqlResult = { columns: string[]; values: unknown[][] };
 
@@ -226,6 +233,28 @@ export class AppDatabase {
       displayName: row.displayName,
       isAllowed: Boolean(row.isAllowed)
     }));
+  }
+
+  public getSenderIdentityById(telegramUserId: string): SenderIdentity | undefined {
+    const row = this.get<SenderRow>(
+      `SELECT telegram_user_id as telegramUserId,
+              username,
+              display_name as displayName,
+              is_allowed as isAllowed
+       FROM sender_identities
+       WHERE telegram_user_id = $telegramUserId`,
+      { $telegramUserId: telegramUserId }
+    );
+    if (!row) {
+      return undefined;
+    }
+
+    return {
+      telegramUserId: row.telegramUserId,
+      username: row.username,
+      displayName: row.displayName,
+      isAllowed: Boolean(row.isAllowed)
+    };
   }
 
   public getRuntimeConfig(): RuntimeConfig {
@@ -521,6 +550,20 @@ export class AppDatabase {
         $status: status,
         $createdAt: nowIso()
       }
+    );
+  }
+
+  public getControlActionById(id: string): ControlActionRow | undefined {
+    return this.get<ControlActionRow>(
+      `SELECT
+        id,
+        action_type as actionType,
+        payload,
+        status,
+        created_at as createdAt
+      FROM control_actions
+      WHERE id = $id`,
+      { $id: id }
     );
   }
 

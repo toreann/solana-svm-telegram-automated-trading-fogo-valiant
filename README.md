@@ -1,5 +1,7 @@
 # Valiant Telegram-Controlled Trade Bot
 
+Version: `0.1.1`
+
 Local TypeScript bot that:
 
 - reads Telegram signals from one source chat using a Telegram user session,
@@ -7,6 +9,7 @@ Local TypeScript bot that:
 - parses `NOVO SINAL` and `LUCRO` templates,
 - executes Valiant perps via a hybrid adapter,
 - exposes control and notifications through a private Telegram bot.
+- preserves signal entry, TP, and SL decimals while keeping the 3.5% minimum SL guardrail.
 
 ## Setup
 
@@ -35,6 +38,26 @@ Local TypeScript bot that:
 npm install
 ```
 
+## Brave Local Mode
+
+Run Brave in local debugging mode before starting the bot:
+
+```bash
+/snap/bin/brave \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9222 \
+  --user-data-dir="/home/obakex/tellegramautotrade/telegram-trading-bot-svmfogo-valiant/playwright-profile" \
+  https://valiant.trade/perps
+```
+
+Keep this env value pointed at Brave's local DevTools endpoint:
+
+```env
+VALIANT_PLAYWRIGHT_CDP_URL=http://127.0.0.1:9222
+```
+
+Do not set `VALIANT_PLAYWRIGHT_CDP_URL` to `https://valiant.trade/perps`; that URL belongs in the Brave launch command.
+
 ## Telegram Session Login
 
 Generate and save the Telegram user session that reads the signal chat:
@@ -54,6 +77,46 @@ npm run dev
 ```
 
 If `TELEGRAM_SIGNAL_CHAT_ID` is blank, the bot starts in discovery mode and logs each observed Telegram `chatId` plus sender info so you can copy the correct values into your env file.
+
+## Start on Linux Login
+
+Install the user `systemd` services:
+
+```bash
+./scripts/install-startup-service.sh
+```
+
+This installs and starts:
+
+- `valiant-brave.service`, which opens Brave/Chromium with the local debugging port.
+- `telegram-trading-bot.service`, which builds the TypeScript app and runs `npm start`.
+
+The Brave service removes stale Chromium profile locks before launch, waits for port `9222`
+to open, and stays active while that debug port is available. This prevents silent startup
+success when Brave exits without exposing the DevTools endpoint.
+
+Check logs:
+
+```bash
+journalctl --user -u telegram-trading-bot.service -f
+journalctl --user -u valiant-brave.service -f
+```
+
+Stop automatic startup:
+
+```bash
+./scripts/uninstall-startup-service.sh
+```
+
+By default these user services start when you log in. This is the recommended mode when
+the bot depends on an unlocked Brave desktop session. If you want services to start before
+login, enable linger:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+Only enable linger if your Valiant setup does not require an unlocked desktop/browser session.
 
 ## Valiant Private Transport
 
@@ -80,12 +143,29 @@ If `TELEGRAM_SIGNAL_CHAT_ID` is blank, the bot starts in discovery mode and logs
 - If the live browser session stops exposing a decryptable Valiant wallet for the configured master account, the control bot sends a Telegram alert with the title `Brave wallet disconnected`.
 - This check relies on a reachable live debugging endpoint, so keep the browser session behind `VALIANT_PLAYWRIGHT_CDP_URL` running.
 
+## Telegram Control Bot
+
+- The main menu shows the perps account balance from Hyperliquid `totalRawUsd`, not open position notional.
+- Retryable entry failures include a `Retry positioning` button that replays the original entry signal.
+- Position controls can close positions, move SL to entry, reapply TP/SL, or reapply an entry when no live position exists.
+
 ## Entry Risk Guardrails
 
 - Entry signals now enforce a minimum stop-loss distance of 3.5% from the entry price.
 - For `LONG` entries, if the incoming SL is closer than 3.5% below entry, the bot widens it to exactly 3.5% below entry.
 - For `SHORT` entries, if the incoming SL is closer than 3.5% above entry, the bot widens it to exactly 3.5% above entry.
 - When this happens, the Telegram entry notification includes both the original SL and the adjusted SL.
+- Entry, TP, and SL values are otherwise parsed and submitted with their incoming decimal precision instead of being rounded to whole numbers.
+
+## Release Notes
+
+### 0.1.1
+
+- Preserve incoming Entry, TP, and SL decimals from Telegram signals.
+- Keep the 3.5% minimum stop-loss distance guardrail.
+- Show perps account balance in Telegram instead of open trade notional.
+- Add retry-positioning controls for failed entry placement.
+- Add user systemd startup services and a Brave debug launcher that verifies port `9222`.
 
 ## Important Notes
 

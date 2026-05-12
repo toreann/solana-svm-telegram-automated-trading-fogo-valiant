@@ -33,14 +33,14 @@ test("parse entry messages", () => {
   if (parsed.type === "ENTRY") {
     assert.equal(parsed.symbol, "BTC");
     assert.equal(parsed.side, "LONG");
-    assert.equal(parsed.entry, 68497);
-    assert.equal(parsed.takeProfit, 71059);
-    assert.equal(parsed.stopLoss, 67216);
+    assert.equal(parsed.entry, 68497.25);
+    assert.equal(parsed.takeProfit, 71059.05);
+    assert.equal(parsed.stopLoss, 67216.35);
     assert.equal(parsed.leverage, 20);
   }
 });
 
-test("round entry prices to the nearest whole number", () => {
+test("preserve fractional entry prices", () => {
   const parsed = parseSignal(
     `⚡️ LIVE
 
@@ -56,19 +56,19 @@ Entrada: $1,999.56
 ⚡️ Alavancagem máx: 10.0x
 
 Status: Aguardando confirmação`,
-    "rounded-entry",
+    "fractional-entry",
     "2026-03-26T12:00:00.000Z"
   );
   assert.ok(parsed);
   assert.equal(parsed?.type, "ENTRY");
   if (parsed?.type === "ENTRY") {
-    assert.equal(parsed.entry, 2000);
-    assert.equal(parsed.takeProfit, 2200);
-    assert.equal(parsed.stopLoss, 1899);
+    assert.equal(parsed.entry, 1999.56);
+    assert.equal(parsed.takeProfit, 2200.32);
+    assert.equal(parsed.stopLoss, 1899.18);
   }
 });
 
-test("round entry prices that use comma decimals", () => {
+test("preserve entry prices that use comma decimals", () => {
   const parsed = parseSignal(
     `⚡️ LIVE
 
@@ -84,15 +84,15 @@ Entrada: $1.999,56
 ⚡️ Alavancagem máx: 10,0x
 
 Status: Aguardando confirmação`,
-    "rounded-entry-comma",
+    "fractional-entry-comma",
     "2026-03-26T12:00:00.000Z"
   );
   assert.ok(parsed);
   assert.equal(parsed?.type, "ENTRY");
   if (parsed?.type === "ENTRY") {
-    assert.equal(parsed.entry, 2000);
-    assert.equal(parsed.takeProfit, 2200);
-    assert.equal(parsed.stopLoss, 1899);
+    assert.equal(parsed.entry, 1999.56);
+    assert.equal(parsed.takeProfit, 2200.32);
+    assert.equal(parsed.stopLoss, 1899.18);
     assert.equal(parsed.leverage, 10);
   }
 });

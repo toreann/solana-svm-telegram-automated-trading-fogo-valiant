@@ -6,7 +6,7 @@ import type { CallbackQuery, Update } from "telegraf/types";
 
 import type { AppDatabase } from "../db.js";
 import type { TradeOrchestrator } from "../orchestrator.js";
-import type { AgentSessionStatus, PositionState, RuntimeConfig } from "../types.js";
+import type { AccountBalance, AgentSessionStatus, PositionState, RetryPositioningPayload, RuntimeConfig } from "../types.js";
 import { newId } from "../utils.js";
 
 type PromptKey = "marginPerTrade" | "maxLeverageCap" | "profitPartialClosePercent";
@@ -79,14 +79,32 @@ function statusLabel(paused: boolean): string {
   return paused ? "PAUSED" : "ACTIVE";
 }
 
+function formatCurrency(value: number): string {
+  return value.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
+}
+
+export function formatBalanceLine(balance: AccountBalance | null): string {
+  if (!balance) {
+    return "Account balance: *unavailable*";
+  }
+
+  const accountBalance = balance.perpsBalance ?? balance.accountValue;
+  return `Account balance: *$${formatCurrency(accountBalance)} ${balance.currency}*`;
+}
+
 function formatMenu(
   runtimeConfig: RuntimeConfig,
   positions: PositionState[],
-  executionMode: TradeOrchestrator["getExecutionMode"] extends () => infer T ? T : string
+  executionMode: TradeOrchestrator["getExecutionMode"] extends () => infer T ? T : string,
+  accountBalance: AccountBalance | null
 ): string {
   return [
     "*Trade Bot - Main Menu*",
     "",
+    formatBalanceLine(accountBalance),
     `Margin per trade: *$${runtimeConfig.marginPerTrade.toFixed(2)} USDC*`,
     `Leverage cap: *${runtimeConfig.maxLeverageCap}x*`,
     `Partial close: *${runtimeConfig.profitPartialClosePercent}%*`,
@@ -286,7 +304,14 @@ export class TelegramControlBot {
     const orchestrator = this.getOrchestrator();
     const runtimeConfig = orchestrator.getRuntimeConfig();
     const positions = orchestrator.listPositions();
-    await ctx.reply(formatMenu(runtimeConfig, positions, orchestrator.getExecutionMode()), {
+    let accountBalance: AccountBalance | null = null;
+    try {
+      accountBalance = await orchestrator.getAccountBalance();
+    } catch (error) {
+      this.logger.warn({ error }, "Could not fetch account balance for status menu");
+    }
+
+    await ctx.reply(formatMenu(runtimeConfig, positions, orchestrator.getExecutionMode(), accountBalance), {
       parse_mode: "Markdown",
       ...mainKeyboard(runtimeConfig.paused)
     });
@@ -404,6 +429,44 @@ export class TelegramControlBot {
 
     if (callback === "bot:restart") {
       await ctx.reply(await this.requestSelfRestart("button"));
+      return;
+    }
+
+    if (callback.startsWith("retry:positioning:")) {
+      const actionId = callback.split(":")[2];
+      const action = this.database.getControlActionById(actionId);
+      if (!action || action.actionType !== "retry_positioning") {
+        await ctx.reply("Could not find that retry request.");
+        return;
+      }
+
+      try {
+        const payload = JSON.parse(action.payload) as RetryPositioningPayload;
+        const outcome = await orchestrator.retryPositioning(payload.signal, payload.chatId, payload.sender);
+        this.database.appendControlAction(
+          newId(),
+          "retry_positioning_execute",
+          JSON.stringify({ actionId, outcome }),
+          "success"
+        );
+        await ctx.reply(
+          outcome.status === "accepted"
+            ? (outcome.reason
+              ? `Retry positioning submitted. Entry was placed, but there was a warning:\n\n${outcome.reason}`
+              : "Retry positioning submitted successfully.")
+            : outcome.status === "rejected"
+              ? `Retry positioning ran, but the entry was rejected again.\n\nReason: ${outcome.reason ?? "unknown"}`
+              : `Retry positioning was ignored.\n\nReason: ${outcome.reason ?? "unknown"}`
+        );
+      } catch (error) {
+        this.database.appendControlAction(
+          newId(),
+          "retry_positioning_execute",
+          JSON.stringify({ actionId, error: String(error) }),
+          "failed"
+        );
+        await ctx.reply(`Retry positioning failed.\n\n${String(error)}`);
+      }
       return;
     }
 

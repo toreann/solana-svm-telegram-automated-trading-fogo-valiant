@@ -1,4 +1,5 @@
 import type {
+  AccountBalance,
   AgentSessionStatus,
   ExecutionRequest,
   ExecutionResult,
@@ -15,6 +16,7 @@ export interface ExecutionAdapter {
   closePositionReduceOnly(position: PositionState): Promise<ExecutionResult>;
   cancelPendingByTicker(symbol: string): Promise<ExecutionResult>;
   getPositions(): Promise<PositionSnapshot[]>;
+  getAccountBalance?(): Promise<AccountBalance | null>;
   applyProfitAction(request: ProfitActionRequest): Promise<ExecutionResult>;
   syncAgentSession?(): Promise<AgentSessionStatus>;
   getAgentSessionStatus?(): Promise<AgentSessionStatus>;
