@@ -19,6 +19,7 @@ import type {
   ProfitActionRequest
 } from "../src/types.js";
 import type { ExecutionAdapter } from "../src/trading/executionAdapter.js";
+import { leverageAdjustedMargin, leverageMarginMultiplier } from "../src/utils.js";
 import {
   HybridValiantExecutor,
   buildValiantPrivateHeaders,
@@ -507,6 +508,12 @@ await run("format the Valiant order value from margin and leverage", () => {
   assert.equal(formatValiantOrderValue(25, 10), "250");
 });
 
+await run("scale margin to preserve requested leverage exposure", () => {
+  assert.equal(leverageMarginMultiplier(20, 10), 2);
+  assert.equal(leverageAdjustedMargin(150, 20, 10), 300);
+  assert.equal(leverageAdjustedMargin(25, 10, 12), 20.83333333);
+});
+
 await run("format Hyperliquid prices to the allowed tick size", () => {
   assert.equal(formatHyperliquidOrderPrice(145.12654, 1), "145.12");
   assert.equal(formatHyperliquidOrderPrice(84.768, 2), "84.768");
@@ -934,7 +941,7 @@ await run("notify when a live/open position still blocks a new entry", async () 
   cleanup(dbPath);
 });
 
-await run("store the leverage actually applied by the executor", async () => {
+await run("store applied leverage and scale margin to requested exposure", async () => {
   const dbPath = "./data/test-orchestrator.db";
   cleanup(dbPath);
   const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
@@ -945,7 +952,7 @@ await run("store the leverage actually applied by the executor", async () => {
     remoteOrderId: "order-1",
     remotePositionId: "position-1",
     resultingStatus: "OPEN",
-    metadata: { appliedLeverage: 16 }
+    metadata: { appliedLeverage: 10 }
   });
   const orchestrator = new TradeOrchestrator(
     { ...orchestratorConfig, valiantExecutionMode: "private" },
@@ -963,7 +970,7 @@ await run("store the leverage actually applied by the executor", async () => {
       entry: 100,
       takeProfit: 110,
       stopLoss: 95,
-      leverage: 17,
+      leverage: 20,
       statusText: "Aguardando confirmação",
       messageId: "m-applied",
       messageDate: "2026-03-26T00:00:00.000Z",
@@ -974,10 +981,12 @@ await run("store the leverage actually applied by the executor", async () => {
   );
 
   const position = orchestrator.listPositions()[0];
-  assert.equal(position?.leverage, 16);
-  assert.equal(position?.currentSize, 4);
-  assert.match(notifier.notifications.at(-1)?.body ?? "", /Requested leverage: 17x/);
-  assert.match(notifier.notifications.at(-1)?.body ?? "", /Applied leverage: 16x/);
+  assert.equal(position?.leverage, 10);
+  assert.equal(position?.margin, 50);
+  assert.equal(position?.currentSize, 5);
+  assert.match(notifier.notifications.at(-1)?.body ?? "", /Requested leverage: 20x/);
+  assert.match(notifier.notifications.at(-1)?.body ?? "", /Applied leverage: 10x/);
+  assert.match(notifier.notifications.at(-1)?.body ?? "", /Applied margin: 50 USDC \(2x\)/);
 
   db.close();
   cleanup(dbPath);
@@ -1295,6 +1304,89 @@ await run("apply the profit action only once", async () => {
   const position = orchestrator.listPositions()[0];
   assert.equal(position.profitActionApplied, true);
   assert.equal(position.stopLoss, 100);
+  db.close();
+  cleanup(dbPath);
+});
+
+await run("apply profit when the live stop matches after exchange tick formatting", async () => {
+  const dbPath = "./data/test-orchestrator.db";
+  cleanup(dbPath);
+  const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
+  const notifier = new MockNotifier();
+  const executor = new MockExecutor();
+  let liveStopLoss = 2164.8231;
+  let partialCloseCalls = 0;
+  executor.getPositions = async (): Promise<PositionSnapshot[]> => ([
+    {
+      symbol: "ETH",
+      side: "LONG",
+      size: 1.0698,
+      entryPrice: 2243.34,
+      takeProfit: 2326.34,
+      stopLoss: liveStopLoss,
+      status: "OPEN"
+    }
+  ]);
+  executor.moveStopLoss = async (_position: PositionState, _stopLoss: number): Promise<ExecutionResult> => {
+    liveStopLoss = 2243.3;
+    return { status: "accepted", resultingStatus: "OPEN" };
+  };
+  executor.partialCloseReduceOnly = async (_position: PositionState, _percent: number): Promise<ExecutionResult> => {
+    partialCloseCalls += 1;
+    return { status: "accepted", resultingStatus: "OPEN" };
+  };
+  (executor as ExecutionAdapter).pricesMatch = async (symbol, actual, expected): Promise<boolean> =>
+    symbol === "ETH" && actual === 2243.3 && expected === 2243.34;
+
+  const orchestrator = new TradeOrchestrator(
+    { ...orchestratorConfig, symbolWhitelist: [...orchestratorConfig.symbolWhitelist, "ETH"] },
+    db,
+    executor,
+    notifier as unknown as Notifier,
+    { info() {}, error() {}, warn() {} } as never
+  );
+
+  await orchestrator.handleParsedSignal(
+    {
+      type: "ENTRY",
+      symbol: "ETH",
+      side: "LONG",
+      entry: 2243.34,
+      takeProfit: 2326.34,
+      stopLoss: 2164.8231,
+      leverage: 20,
+      statusText: "Aguardando confirmação",
+      messageId: "m-tick-entry",
+      messageDate: "2026-05-13T16:12:28.000Z",
+      rawText: "raw"
+    },
+    "1",
+    { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+  );
+
+  await orchestrator.handleParsedSignal(
+    {
+      type: "PROFIT",
+      symbol: "ETH",
+      side: "LONG",
+      currentProfitPct: 1,
+      leveragedProfitPct: 18,
+      priceFrom: 2243.34,
+      priceTo: 2266.26,
+      messageId: "m-tick-profit",
+      messageDate: "2026-05-13T18:22:28.000Z",
+      rawText: "raw"
+    },
+    "1",
+    { telegramUserId: "42", username: "MacacoClub_bot", displayName: "Macaco Club", isAllowed: true }
+  );
+
+  const position = orchestrator.listPositions()[0];
+  assert.equal(partialCloseCalls, 1);
+  assert.equal(position.profitActionApplied, true);
+  assert.equal(position.stopLoss, 2243.34);
+  assert.equal(position.lastError, null);
+
   db.close();
   cleanup(dbPath);
 });

@@ -26,7 +26,7 @@ import type {
   ProfitActionRequest,
   TradeSide
 } from "../types.js";
-import { normalizeLeverage } from "../utils.js";
+import { leverageAdjustedMargin, normalizeLeverage } from "../utils.js";
 import type { ExecutionAdapter } from "./executionAdapter.js";
 
 function accepted(
@@ -197,6 +197,10 @@ export function pickPreferredLeverageChoice(requested: number, availableValues: 
 
 export function formatValiantOrderValue(margin: number, leverage: number): string {
   return formatDecimal(margin * leverage, 4);
+}
+
+function appliedEntryMargin(request: ExecutionRequest, appliedLeverage: number): number {
+  return leverageAdjustedMargin(request.margin, normalizeLeverage(request.leverage), appliedLeverage);
 }
 
 export function formatHyperliquidOrderPrice(price: number, szDecimals: number): string {
@@ -1408,6 +1412,19 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
     return formatHyperliquidOrderPrice(price, szDecimals);
   }
 
+  public async pricesMatch(symbol: string, actual: number | null | undefined, expected: number): Promise<boolean> {
+    if (typeof actual !== "number" || !Number.isFinite(actual)) {
+      return false;
+    }
+
+    try {
+      const asset = await this.asset(symbol);
+      return this.formatHyperliquidPrice(actual, asset.szDecimals) === this.formatHyperliquidPrice(expected, asset.szDecimals);
+    } catch {
+      return false;
+    }
+  }
+
   private async cancelOrders(orders: HyperliquidOpenOrder[]): Promise<void> {
     if (orders.length === 0) {
       return;
@@ -1627,7 +1644,8 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
       }
 
       const asset = await this.asset(request.symbol);
-      const appliedLeverage = this.effectiveLeverage(request.leverage, asset);
+      const requestedLeverage = normalizeLeverage(request.leverage);
+      const appliedLeverage = this.effectiveLeverage(requestedLeverage, asset);
       const isBuy = request.side === "LONG";
       const referencePrice = this.entryReferencePrice(asset, isBuy);
       if (!(referencePrice > 0)) {
@@ -1637,7 +1655,8 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
         };
       }
 
-      const orderNotional = request.margin * appliedLeverage;
+      const appliedMargin = appliedEntryMargin(request, appliedLeverage);
+      const orderNotional = request.margin * requestedLeverage;
       const size = this.orderSize(orderNotional, referencePrice, asset.szDecimals);
       if (!(size > 0)) {
         return {
@@ -1687,9 +1706,10 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
           adapter: "hyperliquid",
           symbol: request.symbol.toUpperCase(),
           size,
+          appliedMargin,
           orderNotional,
           referencePrice,
-          requestedLeverage: request.leverage,
+          requestedLeverage,
           appliedLeverage,
           statuses: orderResponse.response.data.statuses
         },
@@ -2436,7 +2456,8 @@ class PlaywrightValiantExecutor implements ExecutionAdapter {
         adapter: "playwright",
         verification: "positions-tab",
         marketUrl: page.url(),
-        orderValueUsdc: formatValiantOrderValue(request.margin, appliedLeverage),
+        orderValueUsdc: formatValiantOrderValue(request.margin, normalizeLeverage(request.leverage)),
+        appliedMargin: appliedEntryMargin(request, appliedLeverage),
         appliedLeverage
       });
     } catch {
@@ -2449,7 +2470,8 @@ class PlaywrightValiantExecutor implements ExecutionAdapter {
         adapter: "playwright",
         verification: "open-orders-tab",
         marketUrl: page.url(),
-        orderValueUsdc: formatValiantOrderValue(request.margin, appliedLeverage),
+        orderValueUsdc: formatValiantOrderValue(request.margin, normalizeLeverage(request.leverage)),
+        appliedMargin: appliedEntryMargin(request, appliedLeverage),
         appliedLeverage
       });
     } catch {
@@ -2457,7 +2479,8 @@ class PlaywrightValiantExecutor implements ExecutionAdapter {
         adapter: "playwright",
         verification: "assumed-after-submit",
         marketUrl: page.url(),
-        orderValueUsdc: formatValiantOrderValue(request.margin, appliedLeverage),
+        orderValueUsdc: formatValiantOrderValue(request.margin, normalizeLeverage(request.leverage)),
+        appliedMargin: appliedEntryMargin(request, appliedLeverage),
         appliedLeverage
       });
     }
@@ -2488,7 +2511,7 @@ class PlaywrightValiantExecutor implements ExecutionAdapter {
       await this.chooseMarginMode(page);
       const appliedLeverage = await this.setLeverage(page, request.leverage);
       await this.chooseMarketOrderType(page);
-      await this.fillOrderValue(page, formatValiantOrderValue(request.margin, appliedLeverage));
+      await this.fillOrderValue(page, formatValiantOrderValue(request.margin, normalizeLeverage(request.leverage)));
 
       await this.clickFirst(
         [
@@ -2855,6 +2878,24 @@ export class HybridValiantExecutor implements ExecutionAdapter {
     }
 
     return [];
+  }
+
+  public async pricesMatch(symbol: string, actual: number | null | undefined, expected: number): Promise<boolean> {
+    for (const { adapter } of this.adapterSequence()) {
+      if (!adapter.pricesMatch) {
+        continue;
+      }
+
+      try {
+        if (await adapter.pricesMatch(symbol, actual, expected)) {
+          return true;
+        }
+      } catch {
+        // Try the next adapter before falling back to the orchestrator's numeric tolerance.
+      }
+    }
+
+    return false;
   }
 
   public async getAccountBalance(): Promise<AccountBalance | null> {

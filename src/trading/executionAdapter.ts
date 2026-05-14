@@ -16,6 +16,7 @@ export interface ExecutionAdapter {
   closePositionReduceOnly(position: PositionState): Promise<ExecutionResult>;
   cancelPendingByTicker(symbol: string): Promise<ExecutionResult>;
   getPositions(): Promise<PositionSnapshot[]>;
+  pricesMatch?(symbol: string, actual: number | null | undefined, expected: number): Promise<boolean>;
   getAccountBalance?(): Promise<AccountBalance | null>;
   applyProfitAction(request: ProfitActionRequest): Promise<ExecutionResult>;
   syncAgentSession?(): Promise<AgentSessionStatus>;

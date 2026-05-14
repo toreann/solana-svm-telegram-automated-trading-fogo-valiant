@@ -17,7 +17,7 @@ import type {
   RuntimeConfig,
   SenderIdentity
 } from "./types.js";
-import { newId, nowIso, round } from "./utils.js";
+import { leverageAdjustedMargin, leverageMarginMultiplier, newId, nowIso, round } from "./utils.js";
 import type { ExecutionAdapter } from "./trading/executionAdapter.js";
 
 const MIN_ENTRY_STOP_DISTANCE_PCT = 0.035;
@@ -346,7 +346,8 @@ export class TradeOrchestrator {
     remotePositionId?: string,
     status: PositionState["status"] = "OPEN"
   ): PositionState {
-    const size = round((runtimeConfig.marginPerTrade * appliedLeverage) / signal.entry, 8);
+    const appliedMargin = leverageAdjustedMargin(runtimeConfig.marginPerTrade, signal.leverage, appliedLeverage);
+    const size = round((appliedMargin * appliedLeverage) / signal.entry, 8);
     const timestamp = nowIso();
     return {
       id: newId(),
@@ -359,7 +360,7 @@ export class TradeOrchestrator {
       takeProfit: signal.takeProfit,
       stopLoss: signal.stopLoss,
       leverage: appliedLeverage,
-      margin: runtimeConfig.marginPerTrade,
+      margin: appliedMargin,
       sourceMessageId: signal.messageId,
       sourceChatId: chatId,
       senderId,
@@ -405,7 +406,7 @@ export class TradeOrchestrator {
     throw new Error(position.lastError);
   }
 
-  private pricesMatch(actual: number | null | undefined, expected: number): boolean {
+  private numericPricesMatch(actual: number | null | undefined, expected: number): boolean {
     if (typeof actual !== "number" || !Number.isFinite(actual)) {
       return false;
     }
@@ -413,9 +414,17 @@ export class TradeOrchestrator {
     return Math.abs(actual - expected) <= Math.max(1e-8, Math.abs(expected) * 1e-6);
   }
 
+  private async pricesMatch(symbol: string, actual: number | null | undefined, expected: number): Promise<boolean> {
+    if (this.executor.pricesMatch && await this.executor.pricesMatch(symbol, actual, expected)) {
+      return true;
+    }
+
+    return this.numericPricesMatch(actual, expected);
+  }
+
   private async confirmLiveStopLoss(position: PositionState, expectedStopLoss: number, action: string): Promise<void> {
     const livePosition = await this.requireLivePosition(position, action);
-    if (this.pricesMatch(livePosition.stopLoss, expectedStopLoss)) {
+    if (await this.pricesMatch(position.symbol, livePosition.stopLoss, expectedStopLoss)) {
       return;
     }
 
@@ -551,6 +560,13 @@ export class TradeOrchestrator {
     const leverageLines = position.leverage === signal.leverage
       ? [`Leverage: ${position.leverage}x`]
       : [`Requested leverage: ${signal.leverage}x`, `Applied leverage: ${position.leverage}x`];
+    const marginMultiplier = leverageMarginMultiplier(signal.leverage, position.leverage);
+    const marginLines = Math.abs(marginMultiplier - 1) <= 1e-8
+      ? [`Margin: ${position.margin} USDC`]
+      : [
+          `Base margin: ${runtimeConfig.marginPerTrade} USDC`,
+          `Applied margin: ${position.margin} USDC (${round(marginMultiplier, 4)}x)`
+        ];
     await this.notifier.notify({
       type: "ENTRY_PLACED",
       title: isDryRunExecution
@@ -569,7 +585,7 @@ export class TradeOrchestrator {
           : [`Signal SL adjusted from ${adjustedStopLossFrom} to ${position.stopLoss} to enforce a 3.5% minimum stop distance.`]),
         ...(protectionFailureReason ? [`Protection orders: ${protectionFailureReason}`] : ["Protection orders: configured"]),
         ...leverageLines,
-        `Margin: ${position.margin} USDC`,
+        ...marginLines,
         `Message: ${position.sourceMessageId}`
       ].join("\n"),
       dedupeKey: `entry:${position.id}`
@@ -757,11 +773,13 @@ export class TradeOrchestrator {
     }
 
     const appliedLeverage = this.resolveAppliedLeverageFromPosition(position, result);
-    const nextSize = round((position.margin * appliedLeverage) / position.entryPrice, 8);
+    const nextMargin = leverageAdjustedMargin(position.margin, request.leverage, appliedLeverage);
+    const nextSize = round((nextMargin * appliedLeverage) / position.entryPrice, 8);
     position.status = result.resultingStatus ?? "OPEN";
     position.currentSize = nextSize;
     position.initialSize = nextSize;
     position.leverage = appliedLeverage;
+    position.margin = nextMargin;
     position.remoteOrderId = result.remoteOrderId ?? position.remoteOrderId ?? null;
     position.remotePositionId = result.remotePositionId ?? position.remotePositionId ?? null;
     position.profitActionApplied = false;

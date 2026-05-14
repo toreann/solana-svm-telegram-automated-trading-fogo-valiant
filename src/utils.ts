@@ -33,3 +33,28 @@ export function round(value: number, decimals = 8): number {
   const factor = 10 ** decimals;
   return Math.round(value * factor) / factor;
 }
+
+export function leverageMarginMultiplier(requestedLeverage: number, appliedLeverage: number): number {
+  if (
+    !Number.isFinite(requestedLeverage)
+    || requestedLeverage <= 0
+    || !Number.isFinite(appliedLeverage)
+    || appliedLeverage <= 0
+  ) {
+    return 1;
+  }
+
+  return requestedLeverage / appliedLeverage;
+}
+
+export function leverageAdjustedMargin(
+  baseMargin: number,
+  requestedLeverage: number,
+  appliedLeverage: number
+): number {
+  if (!Number.isFinite(baseMargin) || baseMargin <= 0) {
+    return 0;
+  }
+
+  return round(baseMargin * leverageMarginMultiplier(requestedLeverage, appliedLeverage), 8);
+}

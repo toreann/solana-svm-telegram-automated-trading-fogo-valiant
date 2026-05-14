@@ -1,6 +1,6 @@
 # Valiant Telegram-Controlled Trade Bot
 
-Version: `0.1.1`
+Version: `0.1.2`
 
 Local TypeScript bot that:
 
@@ -158,6 +158,12 @@ Only enable linger if your Valiant setup does not require an unlocked desktop/br
 - Entry, TP, and SL values are otherwise parsed and submitted with their incoming decimal precision instead of being rounded to whole numbers.
 
 ## Release Notes
+
+### 0.1.2
+
+- Preserve intended signal exposure when the exchange applies lower leverage by scaling margin proportionally.
+- Show requested leverage, applied leverage, and adjusted margin in entry notifications.
+- Compare live stop-loss confirmations using Hyperliquid tick formatting when available.
 
 ### 0.1.1
 
