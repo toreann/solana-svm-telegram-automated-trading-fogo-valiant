@@ -213,6 +213,8 @@ export class TradeOrchestrator {
         activeAgentAddress: null,
         envFallbackAgentAddress: null,
         approvalStatus: "missing",
+        tradingState: "BLOCKED",
+        browserConnectionStatus: "unchecked",
         lastCheckedAt: new Date().toISOString(),
         lastSyncAt: null,
         lastError: "The current execution adapter does not expose agent session status."
@@ -230,6 +232,8 @@ export class TradeOrchestrator {
         activeAgentAddress: null,
         envFallbackAgentAddress: null,
         approvalStatus: "missing",
+        tradingState: "BLOCKED",
+        browserConnectionStatus: "unchecked",
         lastCheckedAt: new Date().toISOString(),
         lastSyncAt: null,
         lastError: "The current execution adapter does not support agent sync."

@@ -75,6 +75,10 @@ export function buildSelfRestartHandoffArgs(
   return ["-e", SELF_RESTART_HANDOFF_SCRIPT, JSON.stringify(plan), String(parentPid)];
 }
 
+export function isSystemdSupervised(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(env.INVOCATION_ID || env.JOURNAL_STREAM);
+}
+
 function statusLabel(paused: boolean): string {
   return paused ? "PAUSED" : "ACTIVE";
 }
@@ -158,11 +162,11 @@ function positionsKeyboard(positions: PositionState[]) {
 }
 
 function formatAgentStatus(status: AgentSessionStatus): string {
-  const tradingState = status.approvalStatus === "ready" || status.approvalStatus === "synced" ? "GREEN" : "BLOCKED";
   return [
     "*Agent Approval*",
-    `Trading state: *${tradingState}*`,
+    `Trading state: *${status.tradingState}*`,
     `Approval status: *${status.approvalStatus}*`,
+    `Browser wallet: *${status.browserConnectionStatus}*`,
     `Master account: ${status.masterAccountAddress ?? "n/a"}`,
     `Approved exchange agent: ${status.approvedAgentAddress ?? "n/a"}`,
     `Active in-memory agent: ${status.activeAgentAddress ?? "n/a"}`,
@@ -180,6 +184,9 @@ function isAuthorized(ctx: Context, ownerChatId: string, ownerUserId: string): b
 export class TelegramControlBot {
   public readonly bot: Telegraf;
   private readonly prompts = new Map<string, PromptState>();
+  private readonly callbacksInFlight = new Set<string>();
+  private cachedAccountBalance: AccountBalance | null = null;
+  private balanceRefreshInFlight?: Promise<void>;
   private orchestrator?: TradeOrchestrator;
   private handlersRegistered = false;
 
@@ -236,19 +243,21 @@ export class TelegramControlBot {
     });
 
     this.bot.command("syncpositions", async (ctx) => {
-      await this.syncPositionsAndConfirm(ctx);
+      await this.dispatchSlowCommand(ctx, "positions:sync", () => this.syncPositionsAndConfirm(ctx));
     });
 
     this.bot.command("restartbot", async (ctx) => {
-      await ctx.reply(await this.requestSelfRestart("command"));
+      await this.dispatchSlowCommand(ctx, "bot:restart", async () => {
+        await ctx.reply(await this.requestSelfRestart("command"));
+      });
     });
 
     this.bot.command("syncagent", async (ctx) => {
-      await this.syncAgentAndConfirm(ctx);
+      await this.dispatchSlowCommand(ctx, "agent:sync", () => this.syncAgentAndConfirm(ctx));
     });
 
     this.bot.command("checkagent", async (ctx) => {
-      await this.checkAgentAndConfirm(ctx);
+      await this.dispatchSlowCommand(ctx, "agent:check", () => this.checkAgentAndConfirm(ctx));
     });
 
     this.bot.on("text", async (ctx, next) => {
@@ -284,12 +293,79 @@ export class TelegramControlBot {
 
     this.bot.on("callback_query", async (ctx) => {
       const callback = (ctx.callbackQuery as CallbackQuery.DataQuery).data;
-      await this.handleCallback(
-        ctx as NarrowedContext<Context<Update>, Update.CallbackQueryUpdate<CallbackQuery.DataQuery>>,
-        callback
-      );
-      await ctx.answerCbQuery();
+      const callbackContext = ctx as NarrowedContext<Context<Update>, Update.CallbackQueryUpdate<CallbackQuery.DataQuery>>;
+      await this.dispatchCallback(callbackContext, callback);
     });
+  }
+
+  private async dispatchCallback(
+    ctx: NarrowedContext<Context<Update>, Update.CallbackQueryUpdate<CallbackQuery.DataQuery>>,
+    callback: string
+  ): Promise<void> {
+    await ctx.answerCbQuery("Working…").catch((error) => {
+      this.logger.debug({ error, callback }, "Could not acknowledge Telegram callback query");
+    });
+
+    const inFlightKey = this.inFlightKey(callback);
+    if (!inFlightKey) {
+      await this.executeCallback(ctx, callback);
+      return;
+    }
+    if (this.callbacksInFlight.has(inFlightKey)) {
+      await ctx.reply("That action is already in progress.");
+      return;
+    }
+
+    this.callbacksInFlight.add(inFlightKey);
+    await ctx.reply("Working… I will send the result when it is ready.");
+    void this.executeCallback(ctx, callback).finally(() => {
+      this.callbacksInFlight.delete(inFlightKey);
+    });
+  }
+
+  private async dispatchSlowCommand(ctx: Context, inFlightKey: string, work: () => Promise<void>): Promise<void> {
+    if (this.callbacksInFlight.has(inFlightKey)) {
+      await ctx.reply("That action is already in progress.");
+      return;
+    }
+
+    this.callbacksInFlight.add(inFlightKey);
+    await ctx.reply("Working… I will send the result when it is ready.");
+    void work().catch(async (error) => {
+      this.logger.error({ error, inFlightKey }, "Telegram command action failed");
+      await ctx.reply(`Action failed.\n\n${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
+    }).finally(() => {
+      this.callbacksInFlight.delete(inFlightKey);
+    });
+  }
+
+  private inFlightKey(callback: string): string | undefined {
+    if (
+      callback === "menu:pnl"
+      || callback === "positions:sync"
+      || callback === "agent:sync"
+      || callback === "agent:check"
+      || callback === "bot:restart"
+      || callback.startsWith("retry:positioning:")
+      || callback.startsWith("position:")
+    ) {
+      return callback;
+    }
+    return undefined;
+  }
+
+  private async executeCallback(
+    ctx: NarrowedContext<Context<Update>, Update.CallbackQueryUpdate<CallbackQuery.DataQuery>>,
+    callback: string
+  ): Promise<void> {
+    try {
+      await this.handleCallback(ctx, callback);
+    } catch (error) {
+      this.logger.error({ error, callback }, "Telegram callback action failed");
+      await ctx.reply(`Action failed.\n\n${error instanceof Error ? error.message : String(error)}`).catch((replyError) => {
+        this.logger.error({ error: replyError, callback }, "Could not deliver Telegram callback failure");
+      });
+    }
   }
 
   private parsePositive(value: string): number {
@@ -304,17 +380,32 @@ export class TelegramControlBot {
     const orchestrator = this.getOrchestrator();
     const runtimeConfig = orchestrator.getRuntimeConfig();
     const positions = orchestrator.listPositions();
-    let accountBalance: AccountBalance | null = null;
-    try {
-      accountBalance = await orchestrator.getAccountBalance();
-    } catch (error) {
-      this.logger.warn({ error }, "Could not fetch account balance for status menu");
-    }
-
-    await ctx.reply(formatMenu(runtimeConfig, positions, orchestrator.getExecutionMode(), accountBalance), {
+    await ctx.reply(formatMenu(runtimeConfig, positions, orchestrator.getExecutionMode(), this.cachedAccountBalance), {
       parse_mode: "Markdown",
       ...mainKeyboard(runtimeConfig.paused)
     });
+    this.refreshAccountBalance(ctx);
+  }
+
+  private refreshAccountBalance(ctx: Context): void {
+    if (this.balanceRefreshInFlight) {
+      return;
+    }
+
+    const hadCachedBalance = Boolean(this.cachedAccountBalance);
+    const refresh = this.getOrchestrator().getAccountBalance().then(async (balance) => {
+      this.cachedAccountBalance = balance;
+      if (!hadCachedBalance && balance) {
+        await ctx.reply(formatBalanceLine(balance), { parse_mode: "Markdown" });
+      }
+    }).catch((error) => {
+      this.logger.warn({ error }, "Could not fetch account balance for status menu");
+    }).finally(() => {
+      if (this.balanceRefreshInFlight === refresh) {
+        this.balanceRefreshInFlight = undefined;
+      }
+    });
+    this.balanceRefreshInFlight = refresh;
   }
 
   private async handleCallback(
@@ -472,22 +563,22 @@ export class TelegramControlBot {
 
     if (callback.startsWith("position:close:")) {
       const positionId = callback.split(":")[2];
-      await orchestrator.closePosition(positionId);
-      await ctx.reply("Position close submitted.");
+      const position = await orchestrator.closePosition(positionId);
+      await ctx.reply(position ? "Position close submitted." : "Could not find that position locally.");
       return;
     }
 
     if (callback.startsWith("position:sl:")) {
       const positionId = callback.split(":")[2];
-      await orchestrator.moveStopLossToEntry(positionId);
-      await ctx.reply("Stop loss moved to entry.");
+      const position = await orchestrator.moveStopLossToEntry(positionId);
+      await ctx.reply(position ? "Stop loss moved to entry." : "Could not find that position locally.");
       return;
     }
 
     if (callback.startsWith("position:tpsl:")) {
       const positionId = callback.split(":")[2];
-      await orchestrator.reapplyProtectionOrders(positionId);
-      await ctx.reply("TP/SL reapplied for the current position.");
+      const position = await orchestrator.reapplyProtectionOrders(positionId);
+      await ctx.reply(position ? "TP/SL reapplied for the current position." : "Could not find that position locally.");
       return;
     }
 
@@ -510,6 +601,19 @@ export class TelegramControlBot {
   private async requestSelfRestart(source: "button" | "command"): Promise<string> {
     const plan = buildSelfRestartPlan();
     try {
+      if (isSystemdSupervised()) {
+        this.database.appendControlAction(
+          newId(),
+          "bot_restart",
+          JSON.stringify({ source, supervisor: "systemd", handoff: false }),
+          "requested"
+        );
+        setTimeout(() => {
+          process.kill(process.pid, "SIGTERM");
+        }, 500);
+        return "Restart requested. The systemd service will relaunch the bot after this process shuts down.";
+      }
+
       const handoff = spawn(process.execPath, buildSelfRestartHandoffArgs(plan), {
         cwd: plan.cwd,
         env: { ...process.env },
@@ -537,8 +641,8 @@ export class TelegramControlBot {
     }
   }
 
-  public async launch(): Promise<void> {
-    await this.bot.launch();
+  public launch(onError: (error: unknown) => void): void {
+    void this.bot.launch().catch(onError);
   }
 
   public stop(reason = "SIGINT"): void {

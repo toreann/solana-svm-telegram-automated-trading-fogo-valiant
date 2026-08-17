@@ -2,6 +2,7 @@
 Description=Telegram Trading Bot
 Wants=valiant-brave.service
 After=valiant-brave.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -11,6 +12,8 @@ EnvironmentFile=-%h/tellegramautotrade/telegram-trading-bot-svmfogo-valiant/env.
 ExecStart=%h/tellegramautotrade/telegram-trading-bot-svmfogo-valiant/scripts/start-bot.sh
 Restart=always
 RestartSec=10
+RestartSteps=6
+RestartMaxDelaySec=10min
 
 [Install]
 WantedBy=default.target

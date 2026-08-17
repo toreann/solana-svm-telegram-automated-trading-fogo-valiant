@@ -1,5 +1,3 @@
-import { chromium } from "playwright-core";
-
 import { getLoadedEnvFiles, loadConfig } from "./config.js";
 import { AppDatabase } from "./db.js";
 import { createLogger } from "./logger.js";
@@ -10,201 +8,12 @@ import { TelegramControlBot } from "./telegram/controlBot.js";
 import { TelegramSignalIngestor } from "./telegram/signalIngestor.js";
 import {
   HybridValiantExecutor,
-  inferValiantPrivateApiBaseUrl,
-  resolvePlaywrightLiveCdpEndpoint,
-  resolveValiantMarketUrl
+  inferValiantPrivateApiBaseUrl
 } from "./trading/valiantExecutor.js";
+import { newId } from "./utils.js";
 
 const EXCHANGE_SYNC_INTERVAL_MS = 5 * 60 * 1000;
-const LIVE_BROWSER_WALLET_CHECK_INTERVAL_MS = 60 * 1000;
-
-function normalizeHexAddress(value?: string): string | undefined {
-  const normalized = value?.trim();
-  if (!normalized) {
-    return undefined;
-  }
-
-  const withPrefix = normalized.startsWith("0x") ? normalized : `0x${normalized}`;
-  return /^0x[a-fA-F0-9]{40}$/.test(withPrefix) ? withPrefix.toLowerCase() : undefined;
-}
-
-interface LiveBrowserWalletProbeResult {
-  connected: boolean;
-  cdpEndpoint?: string;
-  walletAddresses: string[];
-  reason?: string;
-}
-
-async function probeLiveBrowserWalletConnection(config: ReturnType<typeof loadConfig>): Promise<LiveBrowserWalletProbeResult> {
-  const cdpEndpoint = resolvePlaywrightLiveCdpEndpoint(
-    config.valiantPlaywrightCdpUrl,
-    config.valiantPlaywrightProfileDir
-  );
-  if (!cdpEndpoint) {
-    return {
-      connected: false,
-      walletAddresses: [],
-      reason: `No live Brave debugging endpoint was found for ${config.valiantPlaywrightProfileDir}.`
-    };
-  }
-
-  const browser = await chromium.connectOverCDP(cdpEndpoint);
-  try {
-    const context = browser.contexts()[0];
-    if (!context) {
-      return {
-        connected: false,
-        cdpEndpoint,
-        walletAddresses: [],
-        reason: `Connected to ${cdpEndpoint}, but no browser context was available.`
-      };
-    }
-
-    const marketUrl = resolveValiantMarketUrl(config.valiantBaseUrl, config.valiantMarketRoute);
-    const targetOrigin = new URL(marketUrl).origin;
-    const existingPage = context.pages().find((page) => {
-      try {
-        return new URL(page.url()).origin === targetOrigin;
-      } catch {
-        return false;
-      }
-    });
-    const page = existingPage ?? await context.newPage();
-    if (!existingPage || page.url() !== marketUrl) {
-      await page.goto(marketUrl, {
-        waitUntil: "domcontentloaded",
-        timeout: 30_000
-      });
-    }
-
-    const configuredMasterAccount = normalizeHexAddress(config.valiantMasterAccountAddress);
-    const walletAddresses = await page.evaluate(`
-      (async () => {
-        const DB_NAME = "valiant-agent-keys";
-        const STORE_NAME = "encryption-keys";
-        const STORAGE_PREFIX = "valiant:agent:";
-        const ADDR_PREFIX = "valiant:agent-addr:";
-
-        const openDb = () => new Promise((resolve, reject) => {
-          const request = indexedDB.open(DB_NAME, 1);
-          request.onsuccess = () => resolve(request.result);
-          request.onerror = () => reject(request.error ?? new Error("Failed to open Valiant agent key database"));
-        });
-
-        const unwrapCryptoKey = (value) => {
-          if (value instanceof CryptoKey) {
-            return value;
-          }
-          if (
-            value
-            && typeof value === "object"
-            && "key" in value
-            && value.key instanceof CryptoKey
-          ) {
-            return value.key;
-          }
-          return undefined;
-        };
-
-        const readStore = async () => {
-          const db = await openDb();
-          return await new Promise((resolve, reject) => {
-            const transaction = db.transaction(STORE_NAME, "readonly");
-            const store = transaction.objectStore(STORE_NAME);
-            const keysRequest = store.getAllKeys();
-            const valuesRequest = store.getAll();
-
-            transaction.oncomplete = () => {
-              const keys = Array.isArray(keysRequest.result) ? keysRequest.result : [];
-              const values = Array.isArray(valuesRequest.result) ? valuesRequest.result : [];
-              resolve(
-                keys
-                  .map((key, index) => {
-                    const cryptoKey = unwrapCryptoKey(values[index]);
-                    if (!cryptoKey) {
-                      return undefined;
-                    }
-                    return {
-                      key: String(key).toLowerCase(),
-                      cryptoKey
-                    };
-                  })
-                  .filter(Boolean)
-              );
-              db.close();
-            };
-            transaction.onerror = () => {
-              reject(transaction.error ?? new Error("Failed to read Valiant encryption keys"));
-              db.close();
-            };
-          });
-        };
-
-        const decryptPrivateKey = async (cryptoKey, encrypted) => {
-          const bytes = Uint8Array.from(atob(encrypted), (char) => char.charCodeAt(0));
-          const iv = bytes.slice(0, 12);
-          const ciphertext = bytes.slice(12);
-          await crypto.subtle.decrypt({ name: "AES-GCM", iv }, cryptoKey, ciphertext);
-        };
-
-        const keyEntries = await readStore();
-        const results = [];
-
-        for (const entry of keyEntries) {
-          const encrypted = localStorage.getItem(STORAGE_PREFIX + entry.key);
-          if (!encrypted) {
-            continue;
-          }
-
-          try {
-            await decryptPrivateKey(entry.cryptoKey, encrypted);
-            const agentAddress = localStorage.getItem(ADDR_PREFIX + entry.key)?.toLowerCase();
-            if (agentAddress) {
-              results.push({
-                userAddress: entry.key,
-                agentAddress
-              });
-            }
-          } catch {
-          }
-        }
-
-        return results;
-      })()
-    `) as Array<{ userAddress?: string; agentAddress?: string }>;
-
-    const matchingAddresses = walletAddresses
-      .filter((candidate) => !configuredMasterAccount || candidate.userAddress === configuredMasterAccount)
-      .map((candidate) => candidate.agentAddress)
-      .filter((value): value is string => Boolean(value));
-
-    if (matchingAddresses.length === 0) {
-      return {
-        connected: false,
-        cdpEndpoint,
-        walletAddresses: [],
-        reason: configuredMasterAccount
-          ? `Brave is open at ${cdpEndpoint}, but no decryptable Valiant wallet session is connected for ${configuredMasterAccount}.`
-          : `Brave is open at ${cdpEndpoint}, but no decryptable Valiant wallet session is available.`
-      };
-    }
-
-    return {
-      connected: true,
-      cdpEndpoint,
-      walletAddresses: matchingAddresses
-    };
-  } catch (error) {
-    return {
-      connected: false,
-      cdpEndpoint,
-      walletAddresses: [],
-      reason: error instanceof Error ? error.message : String(error)
-    };
-  } finally {
-    await browser.close().catch(() => undefined);
-  }
-}
+const HEALTHY_RUN_DELAY_MS = 5 * 60 * 1000;
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -215,6 +24,8 @@ async function main(): Promise<void> {
     config.valiantBaseUrl
   );
   const database = await AppDatabase.open(config.databasePath, config.defaultRuntimeConfig);
+  const runId = newId();
+  const runStart = database.beginBotRun(runId);
   const senderFilter = new SenderFilter(database, config.telegramAllowedSenderIds, config.telegramAllowedSenderLabels);
   const executor = new HybridValiantExecutor(config);
   const controlBot = new TelegramControlBot(
@@ -227,7 +38,7 @@ async function main(): Promise<void> {
   const notifier = new Notifier(database, controlBot.bot, config.controlOwnerChatId);
   const orchestrator = new TradeOrchestrator(config, database, executor, notifier, logger);
   controlBot.attachOrchestrator(orchestrator);
-  const ingestor = new TelegramSignalIngestor(config, senderFilter, orchestrator, logger);
+  const ingestor = new TelegramSignalIngestor(config, senderFilter, orchestrator, logger, notifier);
 
   logger.info(
     {
@@ -237,6 +48,7 @@ async function main(): Promise<void> {
       allowedSenderLabelsConfigured: config.telegramAllowedSenderLabels.length,
       executionMode: config.valiantExecutionMode,
       privateApiBaseUrl: inferredPrivateApiBaseUrl,
+      walletCheckIntervalMinutes: config.valiantWalletCheckIntervalMinutes,
       privateAuthMode: config.valiantMasterAccountAddress ? "dynamic-agent-session" : config.valiantAgentKey ? "env-fallback-agent-key" : "legacy-or-none"
     },
     config.telegramSignalChatId
@@ -246,24 +58,38 @@ async function main(): Promise<void> {
 
   await ingestor.connect();
 
-  await controlBot.launch();
-  await notifier.notify({
-    type: "INFO",
-    title: "Trade Bot started",
-    body: "Trade Bot started and listening for signals.",
-    dedupeKey: `startup:${new Date().toISOString().slice(0, 16)}`
+  controlBot.launch((error) => {
+    logger.fatal({ error }, "Control bot polling failed");
+    process.exit(1);
   });
+  if (runStart.shouldAlert && runStart.incidentId) {
+    await notifier.notify({
+      type: "ERROR",
+      title: "Trade Bot restart loop detected",
+      body: [
+        `The bot failed to remain healthy ${runStart.failedStarts} times within ten minutes.`,
+        "Automatic restart delays will increase up to ten minutes while recovery is attempted.",
+        `Incident: ${runStart.incidentId}`
+      ].join("\n"),
+      dedupeKey: `restart-loop:${runStart.incidentId}`
+    });
+    database.markIncidentAlertSent(runStart.incidentId);
+  }
 
   try {
-    const agentStatus = await orchestrator.getAgentSessionStatus();
-    logger.info({ agentStatus }, "Agent session status checked at startup");
+    const agentStatus = await orchestrator.syncAgentSession();
+    logger.info({ agentStatus }, "Agent session synchronized at startup");
     if (config.valiantExecutionMode === "private" || config.valiantExecutionMode === "hybrid") {
-      const isTradingReady = agentStatus.approvalStatus === "ready" || agentStatus.approvalStatus === "synced";
-      if (!isTradingReady) {
+      const previousTradingState = database.getOperationalState("agent_trading_state");
+      database.setOperationalState("agent_trading_state", agentStatus.tradingState);
+      if (agentStatus.tradingState === "BLOCKED" && previousTradingState !== "BLOCKED") {
+        const incidentId = newId();
+        database.setOperationalState("agent_blocked_incident_id", incidentId);
         await notifier.notify({
-          type: "INFO",
-          title: "Valiant agent approval required",
+          type: "ERROR",
+          title: "Trading blocked - Valiant agent required",
           body: [
+            `Trading state: ${agentStatus.tradingState}`,
             `Approval status: ${agentStatus.approvalStatus}`,
             `Master account: ${agentStatus.masterAccountAddress ?? "n/a"}`,
             `Approved exchange agent: ${agentStatus.approvedAgentAddress ?? "n/a"}`,
@@ -271,7 +97,7 @@ async function main(): Promise<void> {
             `Env fallback agent: ${agentStatus.envFallbackAgentAddress ?? "n/a"}`,
             `Last error: ${agentStatus.lastError ?? "none"}`
           ].join("\n"),
-          dedupeKey: `agent-startup:${new Date().toISOString().slice(0, 16)}`
+          dedupeKey: `agent-blocked:${incidentId}`
         });
       }
     }
@@ -293,7 +119,6 @@ async function main(): Promise<void> {
     }
   };
 
-  let liveBrowserWalletAlertOpen = false;
   const runLiveBrowserWalletCheck = async (reason: string) => {
     if (!config.valiantMasterAccountAddress) {
       return;
@@ -302,29 +127,33 @@ async function main(): Promise<void> {
       return;
     }
 
-    const probe = await probeLiveBrowserWalletConnection(config);
+    const probe = await executor.getBrowserWalletStatus();
     logger.info({ probe, reason }, "Live Brave wallet session checked");
 
     if (probe.connected) {
-      liveBrowserWalletAlertOpen = false;
+      database.setOperationalState("browser_wallet_health", "healthy");
       return;
     }
 
-    if (liveBrowserWalletAlertOpen) {
+    const previousHealth = database.getOperationalState("browser_wallet_health");
+    database.setOperationalState("browser_wallet_health", "unhealthy");
+    if (previousHealth === "unhealthy" || database.getOperationalState("agent_trading_state") === "BLOCKED") {
       return;
     }
 
-    liveBrowserWalletAlertOpen = true;
+    const incidentId = newId();
+    database.setOperationalState("browser_wallet_incident_id", incidentId);
     await notifier.notify({
       type: "ERROR",
       title: "Brave wallet disconnected",
       body: [
-        "The live Brave session is no longer exposing a usable Valiant wallet session for trading.",
+        "The live Brave session is no longer exposing a usable Valiant wallet session.",
+        "An already-loaded and still-approved agent may continue trading, but a cold restart will require wallet sign-in.",
         `Reason: ${probe.reason ?? "unknown"}`,
-        `Master account: ${normalizeHexAddress(config.valiantMasterAccountAddress) ?? "n/a"}`,
+        `Master account: ${config.valiantMasterAccountAddress ?? "n/a"}`,
         `CDP endpoint: ${probe.cdpEndpoint ?? "n/a"}`
       ].join("\n"),
-      dedupeKey: `brave-wallet-disconnected:${new Date().toISOString().slice(0, 16)}`
+      dedupeKey: `brave-wallet-disconnected:${incidentId}`
     });
   };
 
@@ -335,14 +164,31 @@ async function main(): Promise<void> {
   }, EXCHANGE_SYNC_INTERVAL_MS);
   exchangeSyncInterval.unref();
   const liveBrowserWalletInterval = setInterval(() => {
-    void runLiveBrowserWalletCheck("automatic 1-minute wallet check");
-  }, LIVE_BROWSER_WALLET_CHECK_INTERVAL_MS);
+    void runLiveBrowserWalletCheck(`automatic ${config.valiantWalletCheckIntervalMinutes}-minute wallet check`);
+  }, config.valiantWalletCheckIntervalMinutes * 60 * 1000);
   liveBrowserWalletInterval.unref();
+  const healthyRunTimer = setTimeout(() => {
+    const recovery = database.markBotRunHealthy(runId);
+    if (!recovery.shouldNotifyRecovery || !recovery.incidentId) {
+      return;
+    }
+    void notifier.notify({
+      type: "INFO",
+      title: "Trade Bot recovered",
+      body: `The bot has remained healthy for five minutes.\nIncident: ${recovery.incidentId}`,
+      dedupeKey: `restart-loop-recovered:${recovery.incidentId}`
+    }).then(() => {
+      database.markIncidentRecoverySent(recovery.incidentId!);
+    });
+  }, HEALTHY_RUN_DELAY_MS);
+  healthyRunTimer.unref();
 
   const shutdown = async (signal: string) => {
     logger.info({ signal }, "Shutting down");
     clearInterval(exchangeSyncInterval);
     clearInterval(liveBrowserWalletInterval);
+    clearTimeout(healthyRunTimer);
+    database.endBotRun(runId, signal);
     await ingestor.disconnect();
     controlBot.stop(signal);
     database.close();

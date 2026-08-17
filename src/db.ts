@@ -12,7 +12,7 @@ import type {
   RuntimeConfig,
   SenderIdentity
 } from "./types.js";
-import { ensureParentDir, nowIso } from "./utils.js";
+import { ensureParentDir, newId, nowIso } from "./utils.js";
 
 const require = createRequire(import.meta.url);
 
@@ -25,6 +25,25 @@ type ControlActionRow = {
   status: string;
   createdAt: string;
 };
+
+type OperationalIncidentRow = {
+  id: string;
+  openedAt: string;
+  recoveredAt: string | null;
+  alertSentAt: string | null;
+  recoverySentAt: string | null;
+};
+
+export interface BotRunStartResult {
+  incidentId: string | null;
+  failedStarts: number;
+  shouldAlert: boolean;
+}
+
+export interface BotRunHealthyResult {
+  incidentId: string | null;
+  shouldNotifyRecovery: boolean;
+}
 
 type SqlResult = { columns: string[]; values: unknown[][] };
 
@@ -143,6 +162,29 @@ export class AppDatabase {
         payload TEXT NOT NULL,
         status TEXT NOT NULL,
         created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS bot_runs (
+        id TEXT PRIMARY KEY,
+        started_at TEXT NOT NULL,
+        healthy_at TEXT,
+        stopped_at TEXT,
+        stop_reason TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS operational_incidents (
+        id TEXT PRIMARY KEY,
+        incident_type TEXT NOT NULL,
+        opened_at TEXT NOT NULL,
+        recovered_at TEXT,
+        alert_sent_at TEXT,
+        recovery_sent_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS operational_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       );
     `);
   }
@@ -281,6 +323,142 @@ export class AppDatabase {
       );
     }
     return next;
+  }
+
+  public getOperationalState(key: string): string | undefined {
+    return this.get<{ value: string }>(
+      "SELECT value FROM operational_state WHERE key = $key",
+      { $key: key }
+    )?.value;
+  }
+
+  public setOperationalState(key: string, value: string): void {
+    this.run(
+      `INSERT INTO operational_state (key, value, updated_at)
+       VALUES ($key, $value, $updatedAt)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      { $key: key, $value: value, $updatedAt: nowIso() }
+    );
+  }
+
+  public beginBotRun(runId: string, startedAt = nowIso()): BotRunStartResult {
+    const previousRun = this.get<{ id: string }>(
+      `SELECT id FROM bot_runs
+       WHERE stopped_at IS NULL
+       ORDER BY started_at DESC
+       LIMIT 1`
+    );
+    if (previousRun) {
+      this.run(
+        `UPDATE bot_runs
+         SET stopped_at = $stoppedAt, stop_reason = 'unclean_exit_detected'
+         WHERE id = $id`,
+        { $id: previousRun.id, $stoppedAt: startedAt }
+      );
+    }
+
+    this.run(
+      `INSERT INTO bot_runs (id, started_at, healthy_at, stopped_at, stop_reason)
+       VALUES ($id, $startedAt, NULL, NULL, NULL)`,
+      { $id: runId, $startedAt: startedAt }
+    );
+
+    const latestHealthy = this.get<{ healthyAt: string }>(
+      `SELECT healthy_at as healthyAt FROM bot_runs
+       WHERE healthy_at IS NOT NULL
+       ORDER BY healthy_at DESC
+       LIMIT 1`
+    )?.healthyAt;
+    const tenMinutesAgo = new Date(new Date(startedAt).getTime() - 10 * 60 * 1000).toISOString();
+    const failureWindowStart = latestHealthy && latestHealthy > tenMinutesAgo ? latestHealthy : tenMinutesAgo;
+    const failedStarts = Number(this.get<{ count: number }>(
+      `SELECT COUNT(*) as count FROM bot_runs
+       WHERE started_at >= $windowStart
+         AND healthy_at IS NULL
+         AND (stop_reason = 'unclean_exit_detected' OR id = $runId)`,
+      { $windowStart: failureWindowStart, $runId: runId }
+    )?.count ?? 0);
+
+    let incident = this.get<OperationalIncidentRow>(
+      `SELECT id, opened_at as openedAt, recovered_at as recoveredAt,
+              alert_sent_at as alertSentAt, recovery_sent_at as recoverySentAt
+       FROM operational_incidents
+       WHERE incident_type = 'restart_loop' AND recovered_at IS NULL
+       ORDER BY opened_at DESC
+       LIMIT 1`
+    );
+    if (failedStarts >= 3 && !incident) {
+      const incidentId = newId();
+      this.run(
+        `INSERT INTO operational_incidents
+         (id, incident_type, opened_at, recovered_at, alert_sent_at, recovery_sent_at)
+         VALUES ($id, 'restart_loop', $openedAt, NULL, NULL, NULL)`,
+        { $id: incidentId, $openedAt: startedAt }
+      );
+      incident = {
+        id: incidentId,
+        openedAt: startedAt,
+        recoveredAt: null,
+        alertSentAt: null,
+        recoverySentAt: null
+      };
+    }
+
+    return {
+      incidentId: incident?.id ?? null,
+      failedStarts,
+      shouldAlert: Boolean(incident && !incident.alertSentAt)
+    };
+  }
+
+  public markIncidentAlertSent(incidentId: string): void {
+    this.run(
+      "UPDATE operational_incidents SET alert_sent_at = $sentAt WHERE id = $id",
+      { $id: incidentId, $sentAt: nowIso() }
+    );
+  }
+
+  public markBotRunHealthy(runId: string, healthyAt = nowIso()): BotRunHealthyResult {
+    this.run(
+      "UPDATE bot_runs SET healthy_at = $healthyAt WHERE id = $id AND healthy_at IS NULL",
+      { $id: runId, $healthyAt: healthyAt }
+    );
+    const incident = this.get<OperationalIncidentRow>(
+      `SELECT id, opened_at as openedAt, recovered_at as recoveredAt,
+              alert_sent_at as alertSentAt, recovery_sent_at as recoverySentAt
+       FROM operational_incidents
+       WHERE incident_type = 'restart_loop' AND recovered_at IS NULL
+       ORDER BY opened_at DESC
+       LIMIT 1`
+    );
+    if (!incident) {
+      return { incidentId: null, shouldNotifyRecovery: false };
+    }
+
+    this.run(
+      "UPDATE operational_incidents SET recovered_at = $recoveredAt WHERE id = $id",
+      { $id: incident.id, $recoveredAt: healthyAt }
+    );
+    return {
+      incidentId: incident.id,
+      shouldNotifyRecovery: !incident.recoverySentAt
+    };
+  }
+
+  public markIncidentRecoverySent(incidentId: string): void {
+    this.run(
+      "UPDATE operational_incidents SET recovery_sent_at = $sentAt WHERE id = $id",
+      { $id: incidentId, $sentAt: nowIso() }
+    );
+  }
+
+  public endBotRun(runId: string, reason: string, stoppedAt = nowIso()): void {
+    this.run(
+      `UPDATE bot_runs
+       SET stopped_at = $stoppedAt, stop_reason = $reason
+       WHERE id = $id AND stopped_at IS NULL`,
+      { $id: runId, $stoppedAt: stoppedAt, $reason: reason }
+    );
   }
 
   public upsertPosition(position: PositionState): void {

@@ -78,6 +78,26 @@ npm run dev
 
 If `TELEGRAM_SIGNAL_CHAT_ID` is blank, the bot starts in discovery mode and logs each observed Telegram `chatId` plus sender info so you can copy the correct values into your env file.
 
+## Telegram Reliability
+
+The bot listens to Telegram live updates and also polls the configured signal chat as a safety net. Polling catches fresh messages if the Telegram update loop stalls while the Node process is still running.
+
+Optional env values:
+
+```env
+TELEGRAM_POLL_INTERVAL_SECONDS=30
+TELEGRAM_POLL_LIMIT=20
+TELEGRAM_MAX_SIGNAL_AGE_SECONDS=600
+TELEGRAM_STALE_EXIT_SECONDS=180
+VALIANT_WALLET_CHECK_INTERVAL_MINUTES=60
+```
+
+- `TELEGRAM_POLL_INTERVAL_SECONDS` controls how often the bot checks recent chat messages.
+- `TELEGRAM_POLL_LIMIT` controls how many recent messages it scans each time.
+- `TELEGRAM_MAX_SIGNAL_AGE_SECONDS` prevents old missed entries from being traded after a long outage.
+- `TELEGRAM_STALE_EXIT_SECONDS` sends a Telegram alert and exits the process if polling cannot reach Telegram for too long, allowing the `systemd` service to restart it.
+- `VALIANT_WALLET_CHECK_INTERVAL_MINUTES` controls the passive live-browser wallet check and defaults to 60 minutes.
+
 ## Start on Linux Login
 
 Install the user `systemd` services:
@@ -89,7 +109,16 @@ Install the user `systemd` services:
 This installs and starts:
 
 - `valiant-brave.service`, which opens Brave/Chromium with the local debugging port.
-- `telegram-trading-bot.service`, which builds the TypeScript app and runs `npm start`.
+- `telegram-trading-bot.service`, which builds TypeScript only when the source has changed and then runs `npm start`.
+
+The bot service uses progressive restart delays from 10 seconds up to 10 minutes. Process runs and
+restart-loop incidents are stored in the application database. Three unhealthy starts within ten
+minutes produce one Telegram incident alert; after a run remains healthy for five minutes, the bot
+sends one recovery message. Normal starts do not send a startup notification.
+
+When the bot is running under `systemd`, the Telegram `Restart Bot` control exits the current process
+and lets `systemd` create exactly one replacement. Direct/manual execution retains the detached
+self-restart handoff.
 
 The Brave service removes stale Chromium profile locks before launch, waits for port `9222`
 to open, and stays active while that debug port is available. This prevents silent startup
@@ -139,13 +168,25 @@ Only enable linger if your Valiant setup does not require an unlocked desktop/br
 
 ## Live Browser Monitoring
 
-- In `private` and `hybrid` mode, the bot checks the live Brave/Chrome Valiant session every minute when `VALIANT_MASTER_ACCOUNT_ADDRESS` is set.
+- In `private` and `hybrid` mode, the bot passively checks the live Brave/Chrome Valiant session every 60 minutes by default when `VALIANT_MASTER_ACCOUNT_ADDRESS` is set.
+- The monitor only inspects an already-open Valiant tab. It never opens, navigates, or reloads the page.
+- Concurrent checks share one in-flight probe, preventing overlapping browser operations.
 - If the live browser session stops exposing a decryptable Valiant wallet for the configured master account, the control bot sends a Telegram alert with the title `Brave wallet disconnected`.
+- Wallet-alert state is persisted, so a process restart does not repeat the same disconnection alert.
+- A loaded agent continues trading while Hyperliquid still accepts it; browser disconnection only blocks a cold start that has no usable agent key.
+- Agent and browser health are reported separately:
+  - `READY`: the loaded agent is confirmed approved.
+  - `DEGRADED`: approval could not be rechecked because of a temporary API failure, but the loaded agent remains available and trades are still attempted.
+  - `BLOCKED`: no usable key is loaded, or Hyperliquid explicitly reports that the agent is missing or revoked.
 - This check relies on a reachable live debugging endpoint, so keep the browser session behind `VALIANT_PLAYWRIGHT_CDP_URL` running.
 
 ## Telegram Control Bot
 
 - The main menu shows the perps account balance from Hyperliquid `totalRawUsd`, not open position notional.
+- Every inline button is acknowledged before browser, exchange, or database work begins.
+- Slow controls immediately send a `Working…` message and later send their final success or error result.
+- Duplicate position/retry actions are rejected while the same action is already running.
+- Local menus and configuration render immediately; balance, P&L, exchange sync, and agent operations are fetched asynchronously where needed.
 - Retryable entry failures include a `Retry positioning` button that replays the original entry signal.
 - Position controls can close positions, move SL to entry, reapply TP/SL, or reapply an entry when no live position exists.
 
@@ -158,6 +199,16 @@ Only enable linger if your Valiant setup does not require an unlocked desktop/br
 - Entry, TP, and SL values are otherwise parsed and submitted with their incoming decimal precision instead of being rounded to whole numbers.
 
 ## Release Notes
+
+### Unreleased
+
+- Replace disruptive wallet navigation with a passive, hourly, single-flight browser check.
+- Keep an approved in-memory agent usable across browser logout and temporary approval API failures.
+- Add explicit `READY`, `DEGRADED`, and `BLOCKED` trading states with separate browser health.
+- Fix copied-profile agent discovery cleanup so storage extraction finishes before the browser closes.
+- Remove routine startup notifications and add durable restart-loop incident/recovery alerts.
+- Add progressive `systemd` restart backoff and supervisor-safe Telegram restarts.
+- Acknowledge Telegram buttons immediately and move slow work outside the update-handler timeout.
 
 ### 0.1.2
 

@@ -145,12 +145,26 @@ export type AgentApprovalStatus =
   | "missing"
   | "error";
 
+export type AgentTradingState = "READY" | "DEGRADED" | "BLOCKED";
+export type BrowserConnectionStatus = "connected" | "disconnected" | "unchecked" | "error";
+
+export interface BrowserWalletStatus {
+  connected: boolean;
+  status: BrowserConnectionStatus;
+  cdpEndpoint?: string;
+  walletAddresses: string[];
+  checkedAt: string;
+  reason?: string;
+}
+
 export interface AgentSessionStatus {
   masterAccountAddress?: string;
   approvedAgentAddress?: string | null;
   activeAgentAddress?: string | null;
   envFallbackAgentAddress?: string | null;
   approvalStatus: AgentApprovalStatus;
+  tradingState: AgentTradingState;
+  browserConnectionStatus: BrowserConnectionStatus;
   lastCheckedAt?: string | null;
   lastSyncAt?: string | null;
   lastError?: string | null;
@@ -186,6 +200,11 @@ export interface AppConfig {
   telegramSignalChatId: string;
   telegramAllowedSenderIds: string[];
   telegramAllowedSenderLabels: string[];
+  telegramPollIntervalSeconds: number;
+  telegramPollLimit: number;
+  telegramMaxSignalAgeSeconds: number;
+  telegramStaleExitSeconds: number;
+  valiantWalletCheckIntervalMinutes: number;
   controlBotToken: string;
   controlOwnerChatId: string;
   controlOwnerUserId: string;

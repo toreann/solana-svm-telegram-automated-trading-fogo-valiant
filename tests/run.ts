@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
 
+import type { Logger } from "pino";
 import { privateKeyToAccount } from "viem/accounts";
 
 import { AppDatabase } from "../src/db.js";
@@ -9,7 +10,13 @@ import type { Notifier } from "../src/notifier.js";
 import { TradeOrchestrator } from "../src/orchestrator.js";
 import { parseSignal } from "../src/signals/parser.js";
 import { SenderFilter } from "../src/signals/senderFilter.js";
-import { buildSelfRestartHandoffArgs, buildSelfRestartPlan, formatBalanceLine } from "../src/telegram/controlBot.js";
+import {
+  TelegramControlBot,
+  buildSelfRestartHandoffArgs,
+  buildSelfRestartPlan,
+  formatBalanceLine,
+  isSystemdSupervised
+} from "../src/telegram/controlBot.js";
 import type {
   AppConfig,
   ExecutionRequest,
@@ -22,7 +29,10 @@ import type { ExecutionAdapter } from "../src/trading/executionAdapter.js";
 import { leverageAdjustedMargin, leverageMarginMultiplier } from "../src/utils.js";
 import {
   HybridValiantExecutor,
+  PrivateTransportValiantExecutor,
   buildValiantPrivateHeaders,
+  createSingleFlight,
+  findPageByOrigin,
   formatHyperliquidOrderPrice,
   formatHyperliquidOrderSize,
   formatValiantOrderValue,
@@ -33,6 +43,7 @@ import {
   resolvePlaywrightLiveCdpEndpoint,
   resolveValiantMarketUrl,
   selectApprovedAgentPrivateKey,
+  withAsyncCleanup,
   walletNotConnectedMessage
 } from "../src/trading/valiantExecutor.js";
 
@@ -123,6 +134,11 @@ const orchestratorConfig: AppConfig = {
   telegramSignalChatId: "1",
   telegramAllowedSenderIds: [],
   telegramAllowedSenderLabels: [],
+  telegramPollIntervalSeconds: 30,
+  telegramPollLimit: 20,
+  telegramMaxSignalAgeSeconds: 600,
+  telegramStaleExitSeconds: 180,
+  valiantWalletCheckIntervalMinutes: 60,
   controlBotToken: "bot",
   controlOwnerChatId: "1",
   controlOwnerUserId: "1",
@@ -408,6 +424,45 @@ await run("prefer the browser-approved agent over the configured env key when bo
   assert.equal(selected, browserAgentKey);
 });
 
+await run("keep a loaded approved agent ready without reading the browser", async () => {
+  const activeKey = `0x${"55".repeat(32)}` as `0x${string}`;
+  const activeAddress = privateKeyToAccount(activeKey).address.toLowerCase();
+  const executor = new PrivateTransportValiantExecutor({
+    ...orchestratorConfig,
+    valiantExecutionMode: "private",
+    valiantMasterAccountAddress: "0x8811436f1d51911368ebb2072d92a1bd20e29612",
+    valiantAgentKey: undefined
+  });
+  const internals = executor as unknown as {
+    applyActiveAgentKey(key: `0x${string}`): void;
+    approvedAgentAddresses(master: `0x${string}`): Promise<string[]>;
+    browserStoredAgents(): Promise<unknown[]>;
+  };
+  internals.applyActiveAgentKey(activeKey);
+  internals.approvedAgentAddresses = async () => [activeAddress];
+  let browserReads = 0;
+  internals.browserStoredAgents = async () => {
+    browserReads += 1;
+    return [];
+  };
+
+  const ready = await executor.syncAgentSession();
+  assert.equal(ready.tradingState, "READY");
+  assert.equal(browserReads, 0);
+
+  internals.approvedAgentAddresses = async () => {
+    throw new Error("502 Bad Gateway");
+  };
+  const degraded = await executor.syncAgentSession();
+  assert.equal(degraded.tradingState, "DEGRADED");
+  assert.equal(degraded.activeAgentAddress, activeAddress);
+
+  internals.approvedAgentAddresses = async () => ["0x1111111111111111111111111111111111111111"];
+  const blocked = await executor.syncAgentSession();
+  assert.equal(blocked.tradingState, "BLOCKED");
+  assert.equal(browserReads, 1);
+});
+
 await run("fallback to Playwright when private entry auth fails in private mode", async () => {
   const executor = new HybridValiantExecutor({
     ...orchestratorConfig,
@@ -482,6 +537,60 @@ await run("build detached self-restart handoff args", () => {
   assert.equal(args[3], "4321");
 });
 
+await run("detect systemd supervision without affecting direct execution", () => {
+  assert.equal(isSystemdSupervised({ INVOCATION_ID: "service-run" }), true);
+  assert.equal(isSystemdSupervised({ JOURNAL_STREAM: "8:123" }), true);
+  assert.equal(isSystemdSupervised({}), false);
+});
+
+await run("launch the control bot without blocking startup", async () => {
+  const controlBot = new TelegramControlBot(
+    "123456:test-token",
+    "1",
+    "1",
+    {} as AppDatabase,
+    {} as Logger
+  );
+  const telegraf = controlBot.bot as unknown as { launch: () => Promise<void> };
+  let launchCalls = 0;
+  telegraf.launch = () => {
+    launchCalls += 1;
+    return new Promise<void>(() => undefined);
+  };
+
+  const result = controlBot.launch(() => {
+    assert.fail("A pending polling loop must not report an error");
+  });
+
+  assert.equal(result, undefined);
+  assert.equal(launchCalls, 1);
+});
+
+await run("report background control bot launch failures", async () => {
+  const controlBot = new TelegramControlBot(
+    "123456:test-token",
+    "1",
+    "1",
+    {} as AppDatabase,
+    {} as Logger
+  );
+  const expectedError = new Error("polling failed");
+  const telegraf = controlBot.bot as unknown as { launch: () => Promise<void> };
+  telegraf.launch = async () => {
+    throw expectedError;
+  };
+
+  let reportedError: unknown;
+  controlBot.launch((error) => {
+    reportedError = error;
+  });
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+
+  assert.equal(reportedError, expectedError);
+});
+
 await run("resolve symbol-aware Valiant market routes", () => {
   assert.equal(
     resolveValiantMarketUrl("https://valiant.trade", "/perps/{symbol}", "sol"),
@@ -495,6 +604,138 @@ await run("resolve symbol-aware Valiant market routes", () => {
     resolveValiantMarketUrl("https://valiant.trade", "/perps", "eth"),
     "https://valiant.trade/perps"
   );
+});
+
+await run("reuse an existing Valiant tab without requiring an exact route", () => {
+  const pages = [
+    { url: () => "https://example.com/" },
+    { url: () => "https://valiant.trade/perps/BTC" }
+  ];
+  assert.equal(findPageByOrigin(pages, "https://valiant.trade/perps"), pages[1]);
+});
+
+await run("finish browser storage work before cleanup", async () => {
+  const events: string[] = [];
+  let resolveWork!: (value: string) => void;
+  const work = new Promise<string>((resolve) => {
+    resolveWork = resolve;
+  });
+  const result = withAsyncCleanup(
+    async () => {
+      events.push("work-started");
+      const value = await work;
+      events.push("work-finished");
+      return value;
+    },
+    async () => {
+      events.push("cleanup");
+    }
+  );
+
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["work-started"]);
+  resolveWork("agents");
+  assert.equal(await result, "agents");
+  assert.deepEqual(events, ["work-started", "work-finished", "cleanup"]);
+});
+
+await run("collapse overlapping browser probes into one request", async () => {
+  let calls = 0;
+  let resolveProbe!: (value: number) => void;
+  const probeResult = new Promise<number>((resolve) => {
+    resolveProbe = resolve;
+  });
+  const runProbe = createSingleFlight(async () => {
+    calls += 1;
+    return probeResult;
+  });
+
+  const first = runProbe();
+  const second = runProbe();
+  assert.equal(first, second);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  resolveProbe(42);
+  assert.equal(await first, 42);
+  await runProbe();
+  assert.equal(calls, 2);
+});
+
+await run("track one restart-loop incident and one recovery", async () => {
+  const dbPath = "./data/test-run-health.db";
+  cleanup(dbPath);
+  const db = await AppDatabase.open(dbPath, orchestratorConfig.defaultRuntimeConfig);
+  const base = Date.parse("2026-08-16T12:00:00.000Z");
+  const at = (minutes: number) => new Date(base + minutes * 60_000).toISOString();
+
+  assert.equal(db.beginBotRun("run-1", at(0)).shouldAlert, false);
+  assert.equal(db.beginBotRun("run-2", at(1)).failedStarts, 2);
+  const third = db.beginBotRun("run-3", at(2));
+  assert.equal(third.failedStarts, 3);
+  assert.equal(third.shouldAlert, true);
+  assert.ok(third.incidentId);
+  db.markIncidentAlertSent(third.incidentId!);
+
+  const fourth = db.beginBotRun("run-4", at(3));
+  assert.equal(fourth.incidentId, third.incidentId);
+  assert.equal(fourth.shouldAlert, false);
+  const recovery = db.markBotRunHealthy("run-4", at(8));
+  assert.equal(recovery.incidentId, third.incidentId);
+  assert.equal(recovery.shouldNotifyRecovery, true);
+  db.markIncidentRecoverySent(recovery.incidentId!);
+
+  const normalStart = db.beginBotRun("run-5", at(9));
+  assert.equal(normalStart.failedStarts, 1);
+  assert.equal(normalStart.shouldAlert, false);
+  db.endBotRun("run-5", "SIGTERM", at(10));
+  db.close();
+  cleanup(dbPath);
+});
+
+await run("acknowledge slow callbacks immediately and suppress duplicates", async () => {
+  const logger = {
+    debug() {},
+    error() {},
+    warn() {}
+  } as unknown as Logger;
+  const controlBot = new TelegramControlBot("123456:test-token", "1", "1", {} as AppDatabase, logger);
+  let pnlCalls = 0;
+  let resolvePnl!: (value: { realizedPnl: number; unrealizedPnl: number; openPositions: number; closedPositions: number }) => void;
+  const pnl = new Promise<{ realizedPnl: number; unrealizedPnl: number; openPositions: number; closedPositions: number }>((resolve) => {
+    resolvePnl = resolve;
+  });
+  controlBot.attachOrchestrator({
+    getPnlSummary: async () => {
+      pnlCalls += 1;
+      return pnl;
+    }
+  } as TradeOrchestrator);
+
+  const events: string[] = [];
+  const ctx = {
+    answerCbQuery: async () => {
+      events.push("ack");
+    },
+    reply: async (text: string) => {
+      events.push(text);
+      return {};
+    }
+  };
+  const dispatch = (controlBot as unknown as {
+    dispatchCallback(context: unknown, callback: string): Promise<void>;
+  }).dispatchCallback.bind(controlBot);
+
+  await dispatch(ctx, "menu:pnl");
+  assert.equal(events[0], "ack");
+  assert.match(events[1] ?? "", /Working/);
+  assert.equal(pnlCalls, 1);
+  await dispatch(ctx, "menu:pnl");
+  assert.match(events.at(-1) ?? "", /already in progress/);
+  assert.equal(pnlCalls, 1);
+
+  resolvePnl({ realizedPnl: 1, unrealizedPnl: 2, openPositions: 3, closedPositions: 4 });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.ok(events.some((event) => event.includes("*P&L*")));
 });
 
 await run("pick the safest available leverage chip", () => {

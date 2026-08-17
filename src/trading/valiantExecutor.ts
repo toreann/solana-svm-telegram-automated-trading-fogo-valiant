@@ -19,6 +19,7 @@ import type {
   AccountBalance,
   AgentSessionStatus,
   AppConfig,
+  BrowserWalletStatus,
   ExecutionRequest,
   ExecutionResult,
   PositionSnapshot,
@@ -343,6 +344,8 @@ function emptyAgentSessionStatus(config: AppConfig): AgentSessionStatus {
       ? privateKeyToAccount(normalizeHexPrivateKey(config.valiantAgentKey)!).address.toLowerCase()
       : null,
     approvalStatus: "missing",
+    tradingState: "BLOCKED",
+    browserConnectionStatus: "unchecked",
     lastCheckedAt: null,
     lastSyncAt: null,
     lastError: null
@@ -425,6 +428,41 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
       }
     );
   });
+}
+
+export function findPageByOrigin<T extends { url(): string }>(pages: readonly T[], targetUrl: string): T | undefined {
+  const targetOrigin = new URL(targetUrl).origin;
+  return pages.find((page) => {
+    try {
+      return new URL(page.url()).origin === targetOrigin;
+    } catch {
+      return false;
+    }
+  });
+}
+
+export async function withAsyncCleanup<T>(work: () => Promise<T>, cleanup: () => Promise<void>): Promise<T> {
+  try {
+    return await work();
+  } finally {
+    await cleanup();
+  }
+}
+
+export function createSingleFlight<T>(work: () => Promise<T>): () => Promise<T> {
+  let inFlight: Promise<T> | undefined;
+  return () => {
+    if (inFlight) {
+      return inFlight;
+    }
+    const request = Promise.resolve().then(work).finally(() => {
+      if (inFlight === request) {
+        inFlight = undefined;
+      }
+    });
+    inFlight = request;
+    return request;
+  };
 }
 
 export function resolvePlaywrightExecutablePath(configuredPath?: string): string | undefined {
@@ -567,6 +605,7 @@ class DryRunValiantExecutor implements ExecutionAdapter {
         valiantAgentKey: undefined
       } as AppConfig),
       approvalStatus: "ready",
+      tradingState: "READY",
       lastCheckedAt: new Date().toISOString(),
       lastSyncAt: new Date().toISOString(),
       lastError: null
@@ -601,7 +640,7 @@ interface HyperliquidResolvedPosition {
 
 type HyperliquidOpenOrder = FrontendOpenOrdersResponse[number];
 
-class PrivateTransportValiantExecutor implements ExecutionAdapter {
+export class PrivateTransportValiantExecutor implements ExecutionAdapter {
   private transport?: HttpTransport;
   private exchange?: ExchangeClient;
   private info?: InfoClient;
@@ -612,6 +651,7 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
   private readonly assetCache = new Map<string, Promise<HyperliquidAssetDescriptor>>();
   private agentSessionStatus: AgentSessionStatus;
   private browserAgentDiscoveryError: string | null = null;
+  private readonly runBrowserWalletProbe = createSingleFlight(() => this.probeLiveBrowserWallet());
 
   public constructor(private readonly config: AppConfig) {
     this.agentSessionStatus = emptyAgentSessionStatus(config);
@@ -695,16 +735,16 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
       && existsSync(join(profileRoot, "Default", "Local Storage", "leveldb"));
   }
 
+  private existingValiantPage(context: BrowserContext): Page | undefined {
+    return findPageByOrigin(
+      context.pages(),
+      resolveValiantMarketUrl(this.config.valiantBaseUrl, this.config.valiantMarketRoute)
+    );
+  }
+
   private async openValiantPage(context: BrowserContext): Promise<Page> {
     const marketUrl = resolveValiantMarketUrl(this.config.valiantBaseUrl, this.config.valiantMarketRoute);
-    const targetOrigin = new URL(marketUrl).origin;
-    const existingPage = context.pages().find((page) => {
-      try {
-        return new URL(page.url()).origin === targetOrigin;
-      } catch {
-        return false;
-      }
-    });
+    const existingPage = this.existingValiantPage(context);
 
     const page = existingPage ?? await context.newPage();
     if (!existingPage || page.url() !== marketUrl) {
@@ -828,11 +868,10 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
         throw new Error(`Connected to the live canonical browser at ${cdpEndpoint}, but no browser context was available.`);
       }
 
-      const page = await withTimeout(
-        this.openValiantPage(context),
-        VALIANT_AGENT_DISCOVERY_TIMEOUT_MS,
-        `Opening the Valiant page in the live browser session at ${cdpEndpoint}`
-      );
+      const page = this.existingValiantPage(context);
+      if (!page) {
+        throw new Error(`The live browser at ${cdpEndpoint} has no open Valiant tab.`);
+      }
       return await withTimeout(
         this.collectBrowserStoredAgents(page),
         VALIANT_AGENT_DISCOVERY_TIMEOUT_MS,
@@ -850,33 +889,129 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
     this.copyIfExists(join(profileRoot, "Default", "IndexedDB"), join(tempProfileDir, "Default", "IndexedDB"));
 
     let context: BrowserContext | undefined;
-    try {
+    return withAsyncCleanup(async () => {
       context = await chromium.launchPersistentContext(tempProfileDir, {
         executablePath,
         headless: this.config.valiantPlaywrightHeadless ?? false
       });
       const page = await this.openValiantPage(context);
-      return this.collectBrowserStoredAgents(page);
-    } finally {
+      return await withTimeout(
+        this.collectBrowserStoredAgents(page),
+        VALIANT_AGENT_DISCOVERY_TIMEOUT_MS,
+        "Reading Valiant agent storage from the copied browser profile"
+      );
+    }, async () => {
       await context?.close().catch(() => undefined);
       rmSync(tempProfileDir, { recursive: true, force: true });
+    });
+  }
+
+  private async probeLiveBrowserWallet(): Promise<BrowserWalletStatus> {
+    const checkedAt = new Date().toISOString();
+    const canonicalProfileRoot = resolve(this.config.valiantPlaywrightProfileDir);
+    const cdpEndpoint = resolvePlaywrightLiveCdpEndpoint(
+      this.config.valiantPlaywrightCdpUrl,
+      canonicalProfileRoot
+    );
+    if (!cdpEndpoint) {
+      return {
+        connected: false,
+        status: "disconnected",
+        walletAddresses: [],
+        checkedAt,
+        reason: `No live Brave debugging endpoint was found for ${canonicalProfileRoot}.`
+      };
     }
+
+    let browser: Awaited<ReturnType<typeof chromium.connectOverCDP>> | undefined;
+    try {
+      browser = await withTimeout(
+        chromium.connectOverCDP(cdpEndpoint),
+        VALIANT_AGENT_DISCOVERY_TIMEOUT_MS,
+        `Connecting to the live Valiant browser session at ${cdpEndpoint}`
+      );
+      const context = browser.contexts()[0];
+      if (!context) {
+        return {
+          connected: false,
+          status: "disconnected",
+          cdpEndpoint,
+          walletAddresses: [],
+          checkedAt,
+          reason: `Connected to ${cdpEndpoint}, but no browser context was available.`
+        };
+      }
+
+      const page = this.existingValiantPage(context);
+      if (!page) {
+        return {
+          connected: false,
+          status: "disconnected",
+          cdpEndpoint,
+          walletAddresses: [],
+          checkedAt,
+          reason: "Brave has no open Valiant tab."
+        };
+      }
+
+      const configuredMasterAccount = normalizeHexAddress(this.config.valiantMasterAccountAddress)?.toLowerCase();
+      const candidates = await withTimeout(
+        this.collectBrowserStoredAgents(page),
+        VALIANT_AGENT_DISCOVERY_TIMEOUT_MS,
+        `Reading Valiant agent storage from the live browser session at ${cdpEndpoint}`
+      );
+      const walletAddresses = normalizeAddressList(
+        candidates
+          .filter((candidate) => {
+            const userAddress = normalizeHexAddress(candidate.userAddress)?.toLowerCase();
+            return !configuredMasterAccount || userAddress === configuredMasterAccount;
+          })
+          .map((candidate) => candidateAgentAddress(candidate))
+          .filter((value): value is string => Boolean(value))
+      );
+
+      return walletAddresses.length > 0
+        ? {
+            connected: true,
+            status: "connected",
+            cdpEndpoint,
+            walletAddresses,
+            checkedAt
+          }
+        : {
+            connected: false,
+            status: "disconnected",
+            cdpEndpoint,
+            walletAddresses: [],
+            checkedAt,
+            reason: configuredMasterAccount
+              ? `No decryptable Valiant wallet session is connected for ${configuredMasterAccount}.`
+              : "No decryptable Valiant wallet session is available."
+          };
+    } catch (error) {
+      return {
+        connected: false,
+        status: "error",
+        cdpEndpoint,
+        walletAddresses: [],
+        checkedAt,
+        reason: extractErrorMessage(error)
+      };
+    } finally {
+      await browser?.close().catch(() => undefined);
+    }
+  }
+
+  public getBrowserWalletStatus(): Promise<BrowserWalletStatus> {
+    return this.runBrowserWalletProbe().then((status) => {
+      this.updateAgentSessionStatus({ browserConnectionStatus: status.status });
+      return status;
+    });
   }
 
   private async browserStoredAgents(): Promise<BrowserStoredAgentCandidate[]> {
     this.browserAgentDiscoveryError = null;
-    const executablePath = resolvePlaywrightExecutablePath(this.config.valiantPlaywrightExecutablePath);
-    if (!executablePath) {
-      this.browserAgentDiscoveryError = "No Chrome/Chromium/Brave executable is available for Valiant agent discovery.";
-      return [];
-    }
-
     const canonicalProfileRoot = resolve(this.config.valiantPlaywrightProfileDir);
-    if (!this.hasValiantStorage(canonicalProfileRoot)) {
-      this.browserAgentDiscoveryError = `The canonical Valiant browser profile ${canonicalProfileRoot} does not contain Valiant IndexedDB/local storage yet.`;
-      return [];
-    }
-
     const discoveryErrors: string[] = [];
     const liveCdpEndpoint = resolvePlaywrightLiveCdpEndpoint(
       this.config.valiantPlaywrightCdpUrl,
@@ -887,16 +1022,33 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
       try {
         const liveAgents = await this.extractBrowserStoredAgentsFromLiveSession(liveCdpEndpoint);
         if (liveAgents.length > 0) {
+          this.updateAgentSessionStatus({ browserConnectionStatus: "connected" });
           return liveAgents;
         }
+        this.updateAgentSessionStatus({ browserConnectionStatus: "disconnected" });
         discoveryErrors.push(`Attached to the live canonical browser session at ${liveCdpEndpoint}, but no decryptable Valiant agents were found.`);
       } catch (error) {
+        this.updateAgentSessionStatus({ browserConnectionStatus: "error" });
         discoveryErrors.push(`Live canonical browser attach failed at ${liveCdpEndpoint}: ${extractErrorMessage(error)}`);
       }
     } else {
+      this.updateAgentSessionStatus({ browserConnectionStatus: "disconnected" });
       discoveryErrors.push(
         `No live canonical browser debugging endpoint was found for ${canonicalProfileRoot}. Set VALIANT_PLAYWRIGHT_CDP_URL or launch Brave with --remote-debugging-port.`
       );
+    }
+
+    if (!this.hasValiantStorage(canonicalProfileRoot)) {
+      discoveryErrors.push(`The canonical Valiant browser profile ${canonicalProfileRoot} does not contain Valiant IndexedDB/local storage yet.`);
+      this.browserAgentDiscoveryError = discoveryErrors.join(" | ");
+      return [];
+    }
+
+    const executablePath = resolvePlaywrightExecutablePath(this.config.valiantPlaywrightExecutablePath);
+    if (!executablePath) {
+      discoveryErrors.push("No Chrome/Chromium/Brave executable is available for copied-profile Valiant agent discovery.");
+      this.browserAgentDiscoveryError = discoveryErrors.join(" | ");
+      return [];
     }
 
     try {
@@ -925,6 +1077,7 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
     this.nonceState.clear();
     this.updateAgentSessionStatus({
       activeAgentAddress: this.wallet.address.toLowerCase(),
+      tradingState: "READY",
       lastError: null
     });
     return this.wallet;
@@ -933,7 +1086,10 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
   private async inspectAgentSession(): Promise<AgentSessionStatus> {
     const checkedAt = new Date().toISOString();
     const baseStatus = emptyAgentSessionStatus(this.config);
-    this.updateAgentSessionStatus(baseStatus);
+    this.updateAgentSessionStatus({
+      masterAccountAddress: baseStatus.masterAccountAddress,
+      envFallbackAgentAddress: baseStatus.envFallbackAgentAddress
+    });
 
     try {
       const configuredMasterAccount = normalizeHexAddress(this.config.valiantMasterAccountAddress);
@@ -944,6 +1100,7 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
           return this.updateAgentSessionStatus({
             activeAgentAddress: wallet.address.toLowerCase(),
             approvalStatus: "ready",
+            tradingState: "READY",
             lastCheckedAt: checkedAt,
             lastError: null
           });
@@ -951,6 +1108,7 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
 
         return this.updateAgentSessionStatus({
           approvalStatus: "missing",
+          tradingState: "BLOCKED",
           lastCheckedAt: checkedAt,
           lastError: "VALIANT_MASTER_ACCOUNT_ADDRESS is required for dynamic agent sync."
         });
@@ -967,6 +1125,7 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
           activeAgentAddress,
           envFallbackAgentAddress,
           approvalStatus: "missing",
+          tradingState: "BLOCKED",
           lastCheckedAt: checkedAt,
           lastError: `No approved Valiant agent is currently registered for ${configuredMasterAccount}.`
         });
@@ -978,6 +1137,7 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
           activeAgentAddress,
           envFallbackAgentAddress,
           approvalStatus: "ready",
+          tradingState: "READY",
           lastCheckedAt: checkedAt,
           lastError: null
         });
@@ -992,12 +1152,16 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
         activeAgentAddress,
         envFallbackAgentAddress,
         approvalStatus: "stale",
+        tradingState: "BLOCKED",
         lastCheckedAt: checkedAt,
         lastError: staleReason
       });
     } catch (error) {
+      const activeAgentAddress = this.activeAgentAddress();
       return this.updateAgentSessionStatus({
+        activeAgentAddress,
         approvalStatus: "error",
+        tradingState: activeAgentAddress ? "DEGRADED" : "BLOCKED",
         lastCheckedAt: checkedAt,
         lastError: extractErrorMessage(error)
       });
@@ -1018,6 +1182,7 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
         if (!fallbackKey) {
           return this.updateAgentSessionStatus({
             approvalStatus: "missing",
+            tradingState: "BLOCKED",
             lastCheckedAt: checkedAt,
             lastError: "Cannot sync agent without VALIANT_MASTER_ACCOUNT_ADDRESS or VALIANT_AGENT_KEY fallback."
           });
@@ -1027,6 +1192,7 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
         return this.updateAgentSessionStatus({
           activeAgentAddress: wallet.address.toLowerCase(),
           approvalStatus: "synced",
+          tradingState: "READY",
           lastCheckedAt: checkedAt,
           lastSyncAt: checkedAt,
           lastError: null
@@ -1034,6 +1200,18 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
       }
 
       const approvedAgentAddresses = await this.approvedAgentAddresses(configuredMasterAccount);
+      const activeAgentAddress = this.activeAgentAddress();
+      if (activeAgentAddress && approvedAgentAddresses.includes(activeAgentAddress)) {
+        return this.updateAgentSessionStatus({
+          approvedAgentAddress: approvedAgentAddresses[0] ?? activeAgentAddress,
+          activeAgentAddress,
+          approvalStatus: "ready",
+          tradingState: "READY",
+          lastCheckedAt: checkedAt,
+          lastError: null
+        });
+      }
+
       const browserStoredAgents = await this.browserStoredAgents();
       const selectedAgentKey = selectApprovedAgentPrivateKey({
         configuredAgentKey: this.config.valiantAgentKey,
@@ -1047,6 +1225,7 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
           approvedAgentAddress: approvedAgentAddresses[0] ?? null,
           activeAgentAddress: this.activeAgentAddress(),
           approvalStatus: approvedAgentAddresses.length > 0 ? "stale" : "missing",
+          tradingState: "BLOCKED",
           lastCheckedAt: checkedAt,
           lastError: approvedAgentAddresses.length > 0
             ? walletNotConnectedMessage()
@@ -1060,13 +1239,17 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
         approvedAgentAddress: approvedAgentAddresses[0] ?? wallet.address.toLowerCase(),
         activeAgentAddress: wallet.address.toLowerCase(),
         approvalStatus: "synced",
+        tradingState: "READY",
         lastCheckedAt: checkedAt,
         lastSyncAt: checkedAt,
         lastError: null
       });
     } catch (error) {
+      const activeAgentAddress = this.activeAgentAddress();
       return this.updateAgentSessionStatus({
+        activeAgentAddress,
         approvalStatus: "error",
+        tradingState: activeAgentAddress ? "DEGRADED" : "BLOCKED",
         lastCheckedAt: checkedAt,
         lastError: extractErrorMessage(error)
       });
@@ -1089,8 +1272,15 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
   private async ensureWritableAgentSession(): Promise<void> {
     const configuredMasterAccount = normalizeHexAddress(this.config.valiantMasterAccountAddress);
     if (configuredMasterAccount) {
+      if (this.wallet) {
+        const inspectedStatus = await this.inspectAgentSession();
+        if (inspectedStatus.tradingState === "READY" || inspectedStatus.tradingState === "DEGRADED") {
+          return;
+        }
+      }
+
       const syncedStatus = await this.syncAgentSession();
-      if (syncedStatus.approvalStatus === "ready" || syncedStatus.approvalStatus === "synced") {
+      if (syncedStatus.tradingState === "READY" || syncedStatus.tradingState === "DEGRADED") {
         return;
       }
 
@@ -1098,12 +1288,12 @@ class PrivateTransportValiantExecutor implements ExecutionAdapter {
     }
 
     const status = await this.inspectAgentSession();
-    if (status.approvalStatus === "ready") {
+    if (status.tradingState === "READY" || status.tradingState === "DEGRADED") {
       return;
     }
 
     const syncedStatus = await this.syncAgentSession();
-    if (syncedStatus.approvalStatus === "ready" || syncedStatus.approvalStatus === "synced") {
+    if (syncedStatus.tradingState === "READY" || syncedStatus.tradingState === "DEGRADED") {
       return;
     }
 
@@ -2741,6 +2931,7 @@ class PlaywrightValiantExecutor implements ExecutionAdapter {
   public async getAgentSessionStatus(): Promise<AgentSessionStatus> {
     return this.syncAgentSession();
   }
+
 }
 
 export class HybridValiantExecutor implements ExecutionAdapter {
@@ -2947,5 +3138,19 @@ export class HybridValiantExecutor implements ExecutionAdapter {
       return privateAdapter.getAgentSessionStatus();
     }
     return this.syncAgentSession();
+  }
+
+  public async getBrowserWalletStatus(): Promise<BrowserWalletStatus> {
+    const privateAdapter = this.privateTransport as ExecutionAdapter;
+    if (privateAdapter.getBrowserWalletStatus) {
+      return privateAdapter.getBrowserWalletStatus();
+    }
+    return {
+      connected: false,
+      status: "unchecked",
+      walletAddresses: [],
+      checkedAt: new Date().toISOString(),
+      reason: "The configured execution adapter does not expose live browser wallet status."
+    };
   }
 }

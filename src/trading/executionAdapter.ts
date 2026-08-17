@@ -1,6 +1,7 @@
 import type {
   AccountBalance,
   AgentSessionStatus,
+  BrowserWalletStatus,
   ExecutionRequest,
   ExecutionResult,
   PositionSnapshot,
@@ -21,4 +22,5 @@ export interface ExecutionAdapter {
   applyProfitAction(request: ProfitActionRequest): Promise<ExecutionResult>;
   syncAgentSession?(): Promise<AgentSessionStatus>;
   getAgentSessionStatus?(): Promise<AgentSessionStatus>;
-} 
+  getBrowserWalletStatus?(): Promise<BrowserWalletStatus>;
+}
